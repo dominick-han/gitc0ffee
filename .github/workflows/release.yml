@@ -1,0 +1,22 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@main
+        with:
+          fetch-depth: 0
+      - run: make VERSION=${{ github.ref_name }}
+      - run: make test
+      - run: tar czf gitc0ffee-${{ github.ref_name }}-arm64.tar.gz -C build gitc0ffee
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: gitc0ffee-${{ github.ref_name }}-arm64.tar.gz
+          generate_release_notes: true
