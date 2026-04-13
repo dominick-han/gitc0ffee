@@ -1,4 +1,4 @@
-// test_cpu.cpp — end-to-end CPU solver tests
+// test_cpu.cpp - end-to-end CPU solver tests
 //
 // Mirrors test_gpu.mm: verifies that solve() finds correct SHA1
 // prefix matches for various prefix lengths and commit shapes.

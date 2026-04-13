@@ -1,4 +1,4 @@
-// cpu_solver.cpp — multi-threaded SHA1 brute-force using x86 SHA-NI
+// cpu_solver.cpp - multi-threaded SHA1 brute-force using x86 SHA-NI
 //
 // Each worker thread owns a contiguous salt range and runs autonomously.
 // No barriers, no batching, no shared counters. The only cross-thread
@@ -9,7 +9,7 @@
 //   - Salt encoded via nibble LUT directly to big-endian SHA1 words
 //   - Incremental: MSG0/MSG1 recomputed every 65536 salts, MSG2 every iter
 //   - 4-way interleaved SHA1 to fully saturate SHA-NI pipeline
-//     (sha1rnds4 has 5c latency / 1c throughput — need 4+ streams)
+//     (sha1rnds4 has 5c latency / 1c throughput - need 4+ streams)
 //   - Pre-shuffled mask/target to avoid per-hash ABCD shuffle
 //   - Deferred E computation: only finalize E on prefix match (~0.01% of hashes)
 //   - Per-thread hash counters (no atomic contention for progress)
@@ -31,7 +31,7 @@
 static constexpr int kSaltBytes = 48;
 
 // ---------------------------------------------------------------------------
-// Salt encoding LUT — each nibble (4 bits) → one big-endian 32-bit word
+// Salt encoding LUT - each nibble (4 bits) -> one big-endian 32-bit word
 // ---------------------------------------------------------------------------
 
 static constexpr uint32_t salt_lut[16] = {
@@ -193,7 +193,7 @@ static void sha1_block_shani(const uint8_t data[64], const uint32_t init[5],
 #define R68(P) P##E1=_mm_sha1nexte_epu32(P##E1,P##M1);P##E=P##A;P##M2=_mm_sha1msg2_epu32(P##M2,P##M1);P##A=_mm_sha1rnds4_epu32(P##A,P##E1,3);P##M3=_mm_xor_si128(P##M3,P##M1);
 #define R72(P) P##E=_mm_sha1nexte_epu32(P##E,P##M2);P##E1=P##A;P##M3=_mm_sha1msg2_epu32(P##M3,P##M2);P##A=_mm_sha1rnds4_epu32(P##A,P##E,3);
 #define R76(P) P##E1=_mm_sha1nexte_epu32(P##E1,P##M3);P##E=P##A;P##A=_mm_sha1rnds4_epu32(P##A,P##E1,3);
-// Finalize ABCD only (deferred E — only compute E on prefix match)
+// Finalize ABCD only (deferred E - only compute E on prefix match)
 #define RFIN_ABCD(P) P##A=_mm_add_epi32(P##A,ABCD_INIT);
 
 // SHA1 rounds macro for single-hash path (leftover)
@@ -222,7 +222,7 @@ static void sha1_block_shani(const uint8_t data[64], const uint32_t init[5],
     E0=_mm_sha1nexte_epu32(E0,ES);ABCD=_mm_add_epi32(ABCD,AS);
 
 // ---------------------------------------------------------------------------
-// Worker — each thread owns a salt range, runs autonomously until done.
+// Worker - each thread owns a salt range, runs autonomously until done.
 // Progress tracked via per-thread counter in WorkerResult (no atomics).
 // ---------------------------------------------------------------------------
 
@@ -230,7 +230,7 @@ struct alignas(64) WorkerResult {
     uint64_t salt;
     uint32_t hash[5];
     bool found;
-    volatile uint64_t hashes;  // written by worker, read by main — no atomic needed
+    volatile uint64_t hashes;  // written by worker, read by main - no atomic needed
     char _pad[64 - sizeof(uint64_t) - sizeof(uint32_t)*5 - sizeof(bool) - sizeof(uint64_t)];
 };
 
@@ -251,7 +251,7 @@ static inline bool check_and_store(__m128i A, __m128i E_before_fin, __m128i E0_I
     uint32_t h0 = (uint32_t)_mm_extract_epi32(ABCD_out, 0);
     if (__builtin_expect((h0 & mask0) == target0, 0)) {
         if (pn <= 8 || ((uint32_t)_mm_extract_epi32(ABCD_out, 1) & mask1) == target1) {
-            // Deferred E finalization — only on match
+            // Deferred E finalization - only on match
             __m128i E_final = _mm_sha1nexte_epu32(E_before_fin, E0_INIT);
             result.salt = salt;
             _mm_storeu_si128((__m128i*)result.hash, ABCD_out);
@@ -301,7 +301,7 @@ static void worker(const CPUParams& p, uint64_t salt_start, uint64_t salt_end,
             uint64_t quad_end = s + ((inner_end - s) & ~3ULL);
 
             for (; s < quad_end; s += 4) {
-                // Set up 4 independent message streams — only M2 differs per salt
+                // Set up 4 independent message streams - only M2 differs per salt
                 __m128i aM0=M0_base,aM1=M1_base,aM3=MSG3_C;
                 __m128i bM0=M0_base,bM1=M1_base,bM3=MSG3_C;
                 __m128i cM0=M0_base,cM1=M1_base,cM3=MSG3_C;
@@ -325,17 +325,17 @@ static void worker(const CPUParams& p, uint64_t salt_start, uint64_t salt_end,
                 R4_7(a) R4_7(b) R4_7(c) R4_7(d)
                 R8_11(a) R8_11(b) R8_11(c) R8_11(d)
                 R12_15(a) R12_15(b) R12_15(c) R12_15(d)
-                // Rounds 16-31 (fn changes 0→1 at round 20)
+                // Rounds 16-31 (fn changes 0->1 at round 20)
                 RE(a,0) RE(b,0) RE(c,0) RE(d,0)
                 RO(a,1) RO(b,1) RO(c,1) RO(d,1)
                 RE2(a,1) RE2(b,1) RE2(c,1) RE2(d,1)
                 RO2(a,1) RO2(b,1) RO2(c,1) RO2(d,1)
-                // Rounds 32-47 (fn changes 1→2 at round 40)
+                // Rounds 32-47 (fn changes 1->2 at round 40)
                 RE(a,1) RE(b,1) RE(c,1) RE(d,1)
                 RO(a,1) RO(b,1) RO(c,1) RO(d,1)
                 RE2(a,2) RE2(b,2) RE2(c,2) RE2(d,2)
                 RO2(a,2) RO2(b,2) RO2(c,2) RO2(d,2)
-                // Rounds 48-63 (fn changes 2→3 at round 60)
+                // Rounds 48-63 (fn changes 2->3 at round 60)
                 RE(a,2) RE(b,2) RE(c,2) RE(d,2)
                 RO(a,2) RO(b,2) RO(c,2) RO(d,2)
                 RE2(a,2) RE2(b,2) RE2(c,2) RE2(d,2)
@@ -375,7 +375,7 @@ static void worker(const CPUParams& p, uint64_t salt_start, uint64_t salt_end,
             }
             salt = s;
 
-            // Update counter every 65536 hashes — main thread reads this for progress
+            // Update counter every 65536 hashes - main thread reads this for progress
             result.hashes = salt - salt_start;
         }
     } else {
@@ -448,7 +448,7 @@ std::optional<SolveResult> solve(const ObjectTemplate& tpl,
                                  std::ref(global_found), std::ref(results[t]));
     }
 
-    // Progress: sum per-thread counters (no contention — each on its own cache line)
+    // Progress: sum per-thread counters (no contention - each on its own cache line)
     {
         int next_sec = 1;
         while (!global_found.load(std::memory_order_relaxed)) {
@@ -460,7 +460,7 @@ std::optional<SolveResult> solve(const ObjectTemplate& tpl,
                 uint64_t total = 0;
                 for (unsigned t = 0; t < nthreads; ++t)
                     total += results[t].hashes;
-                fprintf(stderr, "⏳ %.2fG hashes | %.2f GH/s | %ds elapsed\n",
+                fprintf(stderr, "%.2fG hashes | %.2f GH/s | %ds elapsed\n",
                         double(total) / 1e9, double(total) / secs / 1e9, secs);
             }
         }
@@ -501,7 +501,7 @@ std::optional<SolveResult> solve(const ObjectTemplate& tpl,
     double secs = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - t0).count();
     fprintf(stderr,
-        "✓ Found        %s\n"
+        "Found          %s\n"
         "Time           %.2fs\n"
         "Throughput     %.2f GH/s\n"
         "Hashes Tried   %.2fG\n",

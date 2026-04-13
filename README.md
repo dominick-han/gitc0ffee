@@ -2,7 +2,7 @@
 
 Brute-force vanity prefixes for git commit hashes.
 
-Make your commits start with `c0ffee`, `deadbeef`, `badc0de` — or whatever makes you happy.
+Make your commits start with `c0ffee`, `deadbeef`, `badc0de` - or whatever makes you happy.
 
 ## Requirements
 
@@ -39,15 +39,15 @@ make uninstall
 git commit -am 'my changes'
 
 # find a vanity hash (prints the new hash to stdout)
-gitc0ffee --prefix c0ffee
+gitc0ffee c0ffee
 
 # find it and update HEAD in one shot
-gitc0ffee --prefix c0ffee --update-ref
+gitc0ffee c0ffee --write
 ```
 
-Odd-length prefixes work too: `--prefix bad`, `--prefix dec0de5`.
+Odd-length prefixes work too: `bad`, `dec0de5`.
 
-### Example output (macOS — Metal GPU)
+### Example output (macOS - Metal GPU)
 
 ```
 Target Prefix  c0ffee (6 nibbles)
@@ -56,15 +56,15 @@ Object Size    305 bytes
 Salt Offset    256
 
 Device         Apple M4 Pro
-Dispatch       128M × 3 in-flight
+Dispatch       128M x 3 in-flight
 
-✓ Found        c0ffeeb6f8bb842914960286cbd62490fd91b0af
+Found          c0ffeeb6f8bb842914960286cbd62490fd91b0af
 Time           0.04s
 Throughput     8.95 GH/s
 Hashes Tried   0.40G
 ```
 
-### Example output (Linux — CPU SHA-NI)
+### Example output (Linux - CPU SHA-NI)
 
 ```
 Target Prefix  deadbeef (8 nibbles)
@@ -74,7 +74,7 @@ Salt Offset    832
 
 Device         CPU (192 threads, SHA-NI)
 
-✓ Found        deadbeef3f2c6bd3373376c7d821241260274513
+Found          deadbeef3f2c6bd3373376c7d821241260274513
 Time           1.01s
 Throughput     11.16 GH/s
 Hashes Tried   11.27G
@@ -111,26 +111,26 @@ Sustained throughput: ~14 GH/s with SHA-NI.
 6. Write the winning commit object to the git store.
 7. Optionally update HEAD.
 
-The salt and padding are completely invisible — they're trailing whitespace that doesn't show up in `git log`, `git show`, GitHub, or any standard git UI. Your commit message stays clean.
+The salt and padding are completely invisible - they're trailing whitespace that doesn't show up in `git log`, `git show`, GitHub, or any standard git UI. Your commit message stays clean.
 
 ### Key optimizations
 
-- **Invisible salt** — 48-bit salt encoded as trailing spaces and tabs. No visible headers or markers.
-- **Always single-block** — salt at the end of the object means the solver always processes exactly 1 SHA1 block (80 rounds), regardless of commit message length.
-- **Pre-computed SHA1 state** — CPU hashes all blocks before the salt block once.
-- **Nibble-level prefix check** — compares SHA1 words with 4-bit mask granularity. Supports odd-length prefixes.
+- **Invisible salt** - 48-bit salt encoded as trailing spaces and tabs. No visible headers or markers.
+- **Always single-block** - salt at the end of the object means the solver always processes exactly 1 SHA1 block (80 rounds), regardless of commit message length.
+- **Pre-computed SHA1 state** - CPU hashes all blocks before the salt block once.
+- **Nibble-level prefix check** - compares SHA1 words with 4-bit mask granularity. Supports odd-length prefixes.
 
 #### macOS (Metal GPU)
 
-- **Fully unrolled shader** — scalar variables with fused message schedule expansion. No arrays, no loops, zero register spill.
-- **Triple-buffered dispatch** — three Metal command buffers in flight for zero GPU idle time.
+- **Fully unrolled shader** - scalar variables with fused message schedule expansion. No arrays, no loops, zero register spill.
+- **Triple-buffered dispatch** - three Metal command buffers in flight for zero GPU idle time.
 
 #### Linux (CPU SHA-NI)
 
-- **Hardware SHA1 acceleration** — uses x86 SHA-NI instructions (`sha1rnds4`, `sha1nexte`, `sha1msg1`, `sha1msg2`) for native SHA1 block processing.
-- **Nibble LUT salt encoding** — builds SHA1 message words directly from the 48-bit salt via lookup table, skipping byte-level encoding and byte-swap shuffles.
-- **Incremental salt update** — only recomputes the 4 low words each iteration; the 8 high words are reused across 65536 consecutive salts.
-- **Autonomous workers** — each thread owns a contiguous salt range with no synchronization barriers. Scales from 4 cores to 192+.
+- **Hardware SHA1 acceleration** - uses x86 SHA-NI instructions (`sha1rnds4`, `sha1nexte`, `sha1msg1`, `sha1msg2`) for native SHA1 block processing.
+- **Nibble LUT salt encoding** - builds SHA1 message words directly from the 48-bit salt via lookup table, skipping byte-level encoding and byte-swap shuffles.
+- **Incremental salt update** - only recomputes the 4 low words each iteration; the 8 high words are reused across 65536 consecutive salts.
+- **Autonomous workers** - each thread owns a contiguous salt range with no synchronization barriers. Scales from 4 cores to 192+.
 
 ## Testing
 
@@ -162,8 +162,8 @@ tests/
 
 Any hex string works. For inspiration see [Hexspeak](https://en.wikipedia.org/wiki/Hexspeak):
 
-`c0ffee` · `deadbeef` · `badc0de` · `cafebabe` · `f00d` · `beef` · `face` · `decade` · `bad` · `dec0de5`
+`c0ffee` * `deadbeef` * `badc0de` * `cafebabe` * `f00d` * `beef` * `face` * `decade` * `bad` * `dec0de5`
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT - see [LICENSE](LICENSE).

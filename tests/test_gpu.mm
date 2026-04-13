@@ -1,4 +1,4 @@
-// test_gpu.mm — end-to-end GPU solver tests
+// test_gpu.mm - end-to-end GPU solver tests
 //
 // Verifies that solve() finds correct SHA1 prefix matches for
 // various prefix lengths and commit shapes. Each test:

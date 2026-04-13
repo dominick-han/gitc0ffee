@@ -10,7 +10,7 @@ inline uint32_t rotl(uint32_t x, uint32_t n) {
     return (x << n) | (x >> (32u - n));
 }
 
-// Salt encoding: 48-bit salt → 48 bytes → 12 words.
+// Salt encoding: 48-bit salt -> 48 bytes -> 12 words.
 // Each byte encodes 1 bit: space (0x20) = 0, tab (0x09) = 1.
 // LUT maps each nibble to XOR mask against 0x20202020. Single lookup per word.
 static constant uint32_t salt_lut[16] = {
@@ -70,11 +70,11 @@ kernel void bruteforce_sha1(
              c = params.pre_state[2], d = params.pre_state[3],
              e = params.pre_state[4];
 
-    // Rounds 0–15
+    // Rounds 0-15
     R0(0)  R0(1)  R0(2)  R0(3)  R0(4)  R0(5)  R0(6)  R0(7)
     R0(8)  R0(9)  R0(10) R0(11) R0(12) R0(13) R0(14) R0(15)
 
-    // Rounds 16–79: fused expand + rounds
+    // Rounds 16-79: fused expand + rounds
     { uint32_t w16 = rotl(w13 ^ w8  ^ w2  ^ w0,  1u); R0(16)
       uint32_t w17 = rotl(w14 ^ w9  ^ w3  ^ w1,  1u); R0(17)
       uint32_t w18 = rotl(w15 ^ w10 ^ w4  ^ w2,  1u); R0(18)
@@ -143,7 +143,7 @@ kernel void bruteforce_sha1(
 
     uint32_t h0 = params.pre_state[0] + a;
 
-    // Fast prefix check on h0 (covers ≤8 nibble prefixes without computing h1–h4)
+    // Fast prefix check on h0 (covers <=8 nibble prefixes without computing h1-h4)
     uint32_t pn = params.prefix_len;
     if (pn <= 8) {
         uint32_t mask = (pn == 8) ? 0xFFFFFFFFu : (0xFFFFFFFFu << ((8u - pn) * 4u));
@@ -161,7 +161,7 @@ kernel void bruteforce_sha1(
         }
     }
 
-    // Match — write result
+    // Match - write result
     uint expected = 0;
     if (atomic_compare_exchange_weak_explicit(found, &expected, 1u,
             memory_order_relaxed, memory_order_relaxed)) {

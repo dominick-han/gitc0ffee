@@ -64,7 +64,7 @@ std::optional<SolveResult> solve(const ObjectTemplate& tpl,
         id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
         if (!dev) { fprintf(stderr, "Error: No Metal device\n"); return std::nullopt; }
 
-        fprintf(stderr, "Device         %s\nDispatch       %uM × %d in-flight\n\n",
+        fprintf(stderr, "Device         %s\nDispatch       %uM x %d in-flight\n\n",
                 dev.name.UTF8String, kThreads >> 20, kInFlight);
 
         NSError* err = nil;
@@ -141,7 +141,7 @@ std::optional<SolveResult> solve(const ObjectTemplate& tpl,
                     std::chrono::steady_clock::now()-t0).count();
                 if (progress) fprintf(stderr, "\n");
                 fprintf(stderr,
-                    "✓ Found        %s\n"
+                    "Found          %s\n"
                     "Time           %.2fs\n"
                     "Throughput     %.2f GH/s\n"
                     "Hashes Tried   %.2fG\n",
@@ -158,7 +158,7 @@ std::optional<SolveResult> solve(const ObjectTemplate& tpl,
             if (secs >= next_sec) {
                 next_sec = secs + 1;
                 progress = true;
-                fprintf(stderr, "⏳ %.2fG hashes | %.2f GH/s | %ds elapsed\n",
+                fprintf(stderr, "%.2fG hashes | %.2f GH/s | %ds elapsed\n",
                     double(base)/1e9, double(base)/secs/1e9, secs);
             }
 

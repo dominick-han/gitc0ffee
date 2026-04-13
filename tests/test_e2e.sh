@@ -1,5 +1,5 @@
 #!/bin/bash
-# test_e2e.sh — end-to-end tests using the built gitc0ffee binary
+# test_e2e.sh - end-to-end tests using the built gitc0ffee binary
 #
 # Creates a temp git repo, makes commits, runs gitc0ffee, and verifies
 # the resulting hashes actually start with the requested prefix.

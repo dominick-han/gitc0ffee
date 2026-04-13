@@ -19,7 +19,7 @@ int main(int argc, char** argv) {
         else if (arg == "-V" || arg == "--version") {
             std::cerr << "gitc0ffee " << VERSION << "\n"; return 0;
         } else if (arg == "-h" || arg == "--help") {
-            std::cerr << "gitc0ffee — brute-force git commit hash prefixes\n\n"
+            std::cerr << "gitc0ffee - brute-force git commit hash prefixes\n\n"
                       << "Usage: " << argv[0] << " [--prefix HEX] [--update-ref]\n\n"
                       << "  --prefix HEX    hex prefix to match (default: c0ffee)\n"
                       << "  --update-ref    rewrite HEAD to the new commit\n"
@@ -32,7 +32,7 @@ int main(int argc, char** argv) {
     }
 
     if (prefix_hex.size() > 40) {
-        std::cerr << "Error: prefix can't exceed 20 bytes (40 hex chars) — SHA1 is 20 bytes\n"; return 1;
+        std::cerr << "Error: prefix can't exceed 20 bytes (40 hex chars) - SHA1 is 20 bytes\n"; return 1;
     }
     for (char c : prefix_hex) {
         if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {

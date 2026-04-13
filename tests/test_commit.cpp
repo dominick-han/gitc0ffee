@@ -1,4 +1,4 @@
-// test_commit.cpp — template alignment & SHA1 consistency tests
+// test_commit.cpp - template alignment & SHA1 consistency tests
 //
 // Verifies that prepare_template() produces correct git object templates
 // for a wide variety of commit shapes: short/long authors, merges, GPG
@@ -70,7 +70,7 @@ static std::vector<uint8_t> make_commit(
 }
 
 // ---------------------------------------------------------------------------
-// Core check — runs all assertions on a single template
+// Core check - runs all assertions on a single template
 // ---------------------------------------------------------------------------
 
 static void check(const std::string& label, const std::vector<uint8_t>& raw) {
@@ -102,7 +102,7 @@ static void check(const std::string& label, const std::vector<uint8_t>& raw) {
     auto b = tpl; b.set_salt(0xDEADBEEFCAFE);
     ASSERT(cpu_sha1(a.bytes) == cpu_sha1(b.bytes), "SHA1 not deterministic");
 
-    // Different salt → different hash
+    // Different salt -> different hash
     auto c = tpl; c.set_salt(0x1234567890AB);
     ASSERT(cpu_sha1(a.bytes) != cpu_sha1(c.bytes), "different salts same hash");
 
@@ -235,7 +235,7 @@ int main() {
         auto tpl = prepare_template(obj);
         tpl.set_salt(0xABCDEF012345ULL);
         auto payload = tpl.payload();
-        // Re-parse the salted payload and prepare again — should strip old salt
+        // Re-parse the salted payload and prepare again - should strip old salt
         check("re-run idempotency", payload);
     }
 
