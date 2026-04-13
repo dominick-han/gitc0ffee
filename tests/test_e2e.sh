@@ -53,49 +53,49 @@ echo "TAP version 13"
 
 setup_repo
 git commit -q --no-verify -m "test short prefix"
-HASH=$("$BIN" --prefix aa 2>/dev/null)
+HASH=$("$BIN" aa 2>/dev/null)
 check "2-nibble prefix" "aa" "$HASH"
 
 setup_repo
 git commit -q --no-verify -m "test odd prefix"
-HASH=$("$BIN" --prefix bad 2>/dev/null)
+HASH=$("$BIN" bad 2>/dev/null)
 check "3-nibble odd prefix" "bad" "$HASH"
 
 setup_repo
 git commit -q --no-verify -m "test 4 nibble"
-HASH=$("$BIN" --prefix f00d 2>/dev/null)
+HASH=$("$BIN" f00d 2>/dev/null)
 check "4-nibble prefix" "f00d" "$HASH"
 
 setup_repo
 git commit -q --no-verify -m "test 6 nibble"
-HASH=$("$BIN" --prefix c0ffee 2>/dev/null)
+HASH=$("$BIN" c0ffee 2>/dev/null)
 check "6-nibble prefix" "c0ffee" "$HASH"
 
 # --- 8-nibble prefix (the real test, ~2s) ---
 
 setup_repo
 git commit -q --no-verify -m "test 8 nibble"
-HASH=$("$BIN" --prefix deadbeef 2>/dev/null)
+HASH=$("$BIN" deadbeef 2>/dev/null)
 check "8-nibble prefix" "deadbeef" "$HASH"
 
-# --- --update-ref actually updates HEAD ---
+# --- -w actually updates HEAD ---
 
 setup_repo
-git commit -q --no-verify -m "test update-ref"
-HASH=$("$BIN" --prefix c0ffee --update-ref 2>/dev/null)
+git commit -q --no-verify -m "test write"
+HASH=$("$BIN" -w c0ffee 2>/dev/null)
 HEAD=$(git rev-parse HEAD)
 RUN=$((RUN + 1))
 if [ "$HASH" = "$HEAD" ]; then
-    echo "ok $RUN - --update-ref: HEAD matches returned hash"
+    echo "ok $RUN - -w: HEAD matches returned hash"
     PASS=$((PASS + 1))
 else
-    echo "not ok $RUN - --update-ref: HEAD=$HEAD != returned=$HASH"
+    echo "not ok $RUN - -w: HEAD=$HEAD != returned=$HASH"
     FAIL=$((FAIL + 1))
 fi
 
 # --- Re-run on already-salted commit ---
 
-HASH2=$("$BIN" --prefix beef --update-ref 2>/dev/null)
+HASH2=$("$BIN" -w beef 2>/dev/null)
 check "re-run with different prefix" "beef" "$HASH2"
 HEAD2=$(git rev-parse HEAD)
 RUN=$((RUN + 1))
@@ -111,7 +111,7 @@ fi
 
 setup_repo
 git commit -q --no-verify -m "$(python3 -c "print('A' * 2000)")"
-HASH=$("$BIN" --prefix c0ffee 2>/dev/null)
+HASH=$("$BIN" c0ffee 2>/dev/null)
 check "long commit message" "c0ffee" "$HASH"
 
 # --- Multi-line commit message ---
@@ -124,14 +124,14 @@ This is a detailed description of the feature.
 - Point 1
 - Point 2
 - Point 3"
-HASH=$("$BIN" --prefix c0ffee 2>/dev/null)
+HASH=$("$BIN" c0ffee 2>/dev/null)
 check "multi-line message" "c0ffee" "$HASH"
 
 # --- Commit message stays clean (no visible artifacts) ---
 
 setup_repo
 git commit -q --no-verify -m "clean message test"
-"$BIN" --prefix aa --update-ref 2>/dev/null
+"$BIN" -w aa 2>/dev/null
 MSG=$(git log -1 --format="%s")
 RUN=$((RUN + 1))
 if [ "$MSG" = "clean message test" ]; then
@@ -157,7 +157,7 @@ fi
 # --- Error cases ---
 
 RUN=$((RUN + 1))
-if "$BIN" --prefix xyz 2>/dev/null; then
+if "$BIN" xyz 2>/dev/null; then
     echo "not ok $RUN - should reject non-hex prefix"
     FAIL=$((FAIL + 1))
 else
@@ -166,7 +166,7 @@ else
 fi
 
 RUN=$((RUN + 1))
-if "$BIN" --version 2>&1 | grep -q "gitc0ffee"; then
+if "$BIN" -V 2>&1 | grep -q "gitc0ffee"; then
     echo "ok $RUN - --version works"
     PASS=$((PASS + 1))
 else
