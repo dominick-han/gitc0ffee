@@ -1,6 +1,6 @@
 #include "commit.h"
 #include "git.h"
-#include "gpu_solver.h"
+#include "solver.h"
 
 #include <iostream>
 
@@ -49,7 +49,7 @@ int main(int argc, char** argv) {
     std::cerr << "Object Size    " << tpl.bytes.size() << " bytes\n"
               << "Salt Offset    " << tpl.salt_offset << "\n\n";
 
-    auto result = gpu_solve(tpl, prefix_hex);
+    auto result = solve(tpl, prefix_hex);
     if (!result) { std::cerr << "No Solution Found\n"; return 1; }
 
     auto hash = hex_digest_to_string(result->hash);

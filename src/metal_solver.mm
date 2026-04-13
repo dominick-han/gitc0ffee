@@ -1,7 +1,7 @@
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
 
-#include "gpu_solver.h"
+#include "solver.h"
 #include "shader_source.h"
 
 #include <chrono>
@@ -58,7 +58,7 @@ static GPUParams precompute(const ObjectTemplate& tpl, const std::string& prefix
     return p;
 }
 
-std::optional<SolveResult> gpu_solve(const ObjectTemplate& tpl,
+std::optional<SolveResult> solve(const ObjectTemplate& tpl,
                                      const std::string& prefix_hex) {
     @autoreleasepool {
         id<MTLDevice> dev = MTLCreateSystemDefaultDevice();

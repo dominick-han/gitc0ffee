@@ -29,6 +29,7 @@ setup_repo() {
     git init -q
     git config user.name "Test"
     git config user.email "test@test.com"
+    git config core.hooksPath /dev/null
     echo "init" > file.txt
     git add file.txt
 }
@@ -51,36 +52,36 @@ echo "TAP version 13"
 # --- Basic prefix lengths ---
 
 setup_repo
-git commit -q -m "test short prefix"
+git commit -q --no-verify -m "test short prefix"
 HASH=$("$BIN" --prefix aa 2>/dev/null)
 check "2-nibble prefix" "aa" "$HASH"
 
 setup_repo
-git commit -q -m "test odd prefix"
+git commit -q --no-verify -m "test odd prefix"
 HASH=$("$BIN" --prefix bad 2>/dev/null)
 check "3-nibble odd prefix" "bad" "$HASH"
 
 setup_repo
-git commit -q -m "test 4 nibble"
+git commit -q --no-verify -m "test 4 nibble"
 HASH=$("$BIN" --prefix f00d 2>/dev/null)
 check "4-nibble prefix" "f00d" "$HASH"
 
 setup_repo
-git commit -q -m "test 6 nibble"
+git commit -q --no-verify -m "test 6 nibble"
 HASH=$("$BIN" --prefix c0ffee 2>/dev/null)
 check "6-nibble prefix" "c0ffee" "$HASH"
 
 # --- 8-nibble prefix (the real test, ~2s) ---
 
 setup_repo
-git commit -q -m "test 8 nibble"
+git commit -q --no-verify -m "test 8 nibble"
 HASH=$("$BIN" --prefix deadbeef 2>/dev/null)
 check "8-nibble prefix" "deadbeef" "$HASH"
 
 # --- --update-ref actually updates HEAD ---
 
 setup_repo
-git commit -q -m "test update-ref"
+git commit -q --no-verify -m "test update-ref"
 HASH=$("$BIN" --prefix c0ffee --update-ref 2>/dev/null)
 HEAD=$(git rev-parse HEAD)
 RUN=$((RUN + 1))
@@ -109,14 +110,14 @@ fi
 # --- Long commit message ---
 
 setup_repo
-git commit -q -m "$(python3 -c "print('A' * 2000)")"
+git commit -q --no-verify -m "$(python3 -c "print('A' * 2000)")"
 HASH=$("$BIN" --prefix c0ffee 2>/dev/null)
 check "long commit message" "c0ffee" "$HASH"
 
 # --- Multi-line commit message ---
 
 setup_repo
-git commit -q -m "feat: big feature
+git commit -q --no-verify -m "feat: big feature
 
 This is a detailed description of the feature.
 
@@ -129,7 +130,7 @@ check "multi-line message" "c0ffee" "$HASH"
 # --- Commit message stays clean (no visible artifacts) ---
 
 setup_repo
-git commit -q -m "clean message test"
+git commit -q --no-verify -m "clean message test"
 "$BIN" --prefix aa --update-ref 2>/dev/null
 MSG=$(git log -1 --format="%s")
 RUN=$((RUN + 1))

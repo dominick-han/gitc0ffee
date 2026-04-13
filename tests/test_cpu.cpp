@@ -1,11 +1,7 @@
-// test_gpu.mm — end-to-end GPU solver tests
+// test_cpu.cpp — end-to-end CPU solver tests
 //
-// Verifies that solve() finds correct SHA1 prefix matches for
-// various prefix lengths and commit shapes. Each test:
-//   - Builds a template from a synthetic commit
-//   - Runs solve with a target prefix
-//   - Verifies the returned hash starts with the prefix
-//   - Verifies the hash matches CPU SHA1 of the salted object
+// Mirrors test_gpu.mm: verifies that solve() finds correct SHA1
+// prefix matches for various prefix lengths and commit shapes.
 
 #include "commit.h"
 #include "solver.h"
@@ -26,8 +22,8 @@ static std::string cpu_sha1_hex(const std::vector<uint8_t>& data) {
     static constexpr char hx[] = "0123456789abcdef";
     std::string out(40, '0');
     for (int i = 0; i < 20; ++i) {
-        out[i*2]   = hx[hash[i] >> 4];
-        out[i*2+1] = hx[hash[i] & 0xF];
+        out[i * 2]     = hx[hash[i] >> 4];
+        out[i * 2 + 1] = hx[hash[i] & 0xF];
     }
     return out;
 }
@@ -42,7 +38,7 @@ static std::vector<uint8_t> make_commit(const std::string& msg) {
     return {s.begin(), s.end()};
 }
 
-static void check_gpu(const std::string& label, const std::string& prefix,
+static void check_cpu(const std::string& label, const std::string& prefix,
                       const std::string& msg) {
     ++g_run;
 
@@ -72,7 +68,6 @@ static void check_gpu(const std::string& label, const std::string& prefix,
     }
 
     // Verify hash matches CPU SHA1 of the full object
-    // Reconstruct the full git object from the payload
     auto& payload = result->payload;
     std::string hdr = "commit " + std::to_string(payload.size()) + '\0';
     std::vector<uint8_t> full;
@@ -81,7 +76,7 @@ static void check_gpu(const std::string& label, const std::string& prefix,
     auto cpu_hash = cpu_sha1_hex(full);
 
     if (hash != cpu_hash) {
-        fprintf(stderr, "not ok %d - %s: GPU hash %s != CPU hash %s\n",
+        fprintf(stderr, "not ok %d - %s: solver hash %s != CPU hash %s\n",
                 g_run, label.c_str(), hash.c_str(), cpu_hash.c_str());
         ++g_fail;
         return;
@@ -96,22 +91,19 @@ int main() {
     fprintf(stderr, "TAP version 13\n");
 
     // Short prefixes (instant)
-    check_gpu("2-nibble prefix", "aa", "short\n");
-    check_gpu("3-nibble prefix (odd)", "bad", "odd prefix\n");
-    check_gpu("4-nibble prefix", "f00d", "four nibbles\n");
-    check_gpu("5-nibble prefix (odd)", "c0ffe", "five nibbles\n");
-    check_gpu("6-nibble prefix", "c0ffee", "six nibbles\n");
+    check_cpu("2-nibble prefix", "aa", "short\n");
+    check_cpu("3-nibble prefix (odd)", "bad", "odd prefix\n");
+    check_cpu("4-nibble prefix", "f00d", "four nibbles\n");
+    check_cpu("5-nibble prefix (odd)", "c0ffe", "five nibbles\n");
+    check_cpu("6-nibble prefix", "c0ffee", "six nibbles\n");
 
-    // Medium prefix (should take <1s)
-    check_gpu("7-nibble prefix (odd)", "deadbee", "seven nibbles\n");
-
-    // 8-nibble prefix (~2s on M4 Pro)
-    check_gpu("8-nibble prefix", "c0ffeec0", "eight nibbles\n");
+    // Medium prefix
+    check_cpu("7-nibble prefix (odd)", "deadbee", "seven nibbles\n");
 
     // Different commit shapes with 6-nibble prefix
-    check_gpu("long message", "c0ffee", std::string(500, 'X') + "\n");
-    check_gpu("empty message", "c0ffee", "\n");
-    check_gpu("multi-line", "c0ffee",
+    check_cpu("long message", "c0ffee", std::string(500, 'X') + "\n");
+    check_cpu("empty message", "c0ffee", "\n");
+    check_cpu("multi-line", "c0ffee",
         "feat: something\n\nLong description here.\n\n- item 1\n- item 2\n");
 
     // Re-run: solve on an already-salted commit
@@ -125,7 +117,6 @@ int main() {
             fprintf(stderr, "not ok %d - re-run: first solve failed\n", g_run);
             ++g_fail;
         } else {
-            // Feed the salted payload back through
             auto obj2 = parse_commit(r1->payload);
             auto tpl2 = prepare_template(obj2);
             auto r2 = solve(tpl2, "bb");
@@ -138,7 +129,8 @@ int main() {
                     fprintf(stderr, "ok %d - re-run: %s\n", g_run, h.c_str());
                     ++g_pass;
                 } else {
-                    fprintf(stderr, "not ok %d - re-run: %s doesn't start with bb\n", g_run, h.c_str());
+                    fprintf(stderr, "not ok %d - re-run: %s doesn't start with bb\n",
+                            g_run, h.c_str());
                     ++g_fail;
                 }
             }

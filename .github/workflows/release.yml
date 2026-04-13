@@ -8,15 +8,18 @@ permissions:
 
 jobs:
   release:
-    runs-on: macos-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [macos-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@main
         with:
           fetch-depth: 0
       - run: make VERSION=${{ github.ref_name }}
       - run: make test
-      - run: tar czf gitc0ffee-${{ github.ref_name }}-arm64.tar.gz -C build gitc0ffee
+      - run: tar czf gitc0ffee-${{ github.ref_name }}-$(uname -s).tar.gz -C build gitc0ffee
       - uses: softprops/action-gh-release@v3
         with:
-          files: gitc0ffee-${{ github.ref_name }}-arm64.tar.gz
+          files: gitc0ffee-${{ github.ref_name }}-*.tar.gz
           generate_release_notes: true
