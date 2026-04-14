@@ -137,8 +137,11 @@ std::optional<SolveResult> solve(const ObjectTemplate& tpl,
     auto t0 = std::chrono::steady_clock::now();
 
     for (unsigned t = 0; t < nthreads; ++t) {
-        uint64_t start = uint64_t(t) * per_thread;
-        uint64_t end = (t == nthreads - 1) ? kMaxSalt : start + per_thread;
+        // Align start to 16 so SIMD batches never straddle nibble boundaries.
+        uint64_t start = (uint64_t(t) * per_thread + 15) & ~15ULL;
+        uint64_t end = (t == nthreads - 1) ? kMaxSalt
+                     : ((uint64_t(t + 1) * per_thread + 15) & ~15ULL);
+        if (t == 0) start = 0;
         threads[t] = std::thread(worker_fn, std::cref(params), start, end,
                                  std::ref(global_found), std::ref(results[t]));
     }

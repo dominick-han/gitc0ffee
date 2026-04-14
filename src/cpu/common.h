@@ -34,12 +34,14 @@ struct CPUParams {
     uint32_t msg_words[16];   // AVX2/AVX-512: full block as 32-bit words
 };
 
-struct alignas(64) WorkerResult {
-    uint64_t salt;
+struct WorkerResult {
+    // First cache line: progress counter (read by monitoring thread while worker runs)
+    alignas(64) volatile uint64_t hashes;
+
+    // Second cache line: result fields (written only by owning worker, read after join)
+    alignas(64) uint64_t salt;
     uint32_t hash[5];
     bool found;
-    volatile uint64_t hashes;
-    char _pad[64 - sizeof(uint64_t) - sizeof(uint32_t)*5 - sizeof(bool) - sizeof(uint64_t)];
 };
 
 using WorkerFn = void(*)(const CPUParams&, uint64_t, uint64_t,
