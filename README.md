@@ -148,18 +148,26 @@ Runs commit template tests, solver correctness tests, and end-to-end integration
 
 ```
 src/
-  main.cpp          CLI entry point (auto-selects GPU on macOS, CPU on Linux)
-  commit.cpp/.h     Commit parsing and template construction
-  git.cpp/.h        Git plumbing (rev-parse, cat-file, hash-object)
-  metal_solver.mm/.h Metal GPU dispatch and SHA1 pre-computation (macOS)
-  cpu_solver.cpp/.h Multi-threaded SHA1 brute-force: AVX-512 16-way + SHA-NI 4-way (Linux)
-  sha1.metal        Metal compute shader (SHA1 brute-force kernel)
-  types.h           Shared types (HexDigest, ObjectTemplate, SolveResult)
+  main.cpp            CLI entry point (auto-selects GPU on macOS, CPU on Linux)
+  types.h             Shared types (HexDigest, ObjectTemplate, SolveResult)
+  solver.h            Solver interface
+  git/
+    commit.cpp/.h     Commit parsing and template construction
+    git.cpp/.h        Git plumbing (rev-parse, cat-file, hash-object)
+  cpu/
+    solver.cpp        Multi-threaded dispatch and SHA1 pre-computation (Linux)
+    common.h          Shared types and constants for CPU backends
+    avx512.cpp        AVX-512 backend: 16-way SIMD SHA1
+    sha_ni.cpp        SHA-NI backend: 4-way interleaved SHA1
+    avx2.cpp          AVX2 backend: 8-way SIMD SHA1
+  gpu/
+    metal_solver.mm   Metal GPU dispatch and SHA1 pre-computation (macOS)
+    sha1.metal        Metal compute shader (SHA1 brute-force kernel)
 tests/
-  test_commit.cpp   Template alignment and SHA1 consistency tests
-  test_cpu.cpp      CPU solver correctness tests
-  test_gpu.mm       GPU solver correctness tests (macOS)
-  test_e2e.sh       End-to-end integration tests
+  test_commit.cpp     Template alignment and SHA1 consistency tests
+  test_cpu.cpp        CPU solver correctness tests
+  test_gpu.mm         GPU solver correctness tests (macOS)
+  test_e2e.sh         End-to-end integration tests
 ```
 
 ## Prefix ideas

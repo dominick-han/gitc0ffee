@@ -1,6 +1,6 @@
 #pragma once
 
-#include "types.h"
+#include "../types.h"
 
 struct CommitObject {
     std::vector<std::string> headers;

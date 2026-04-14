@@ -1,5 +1,5 @@
-#include "commit.h"
-#include "git.h"
+#include "git/commit.h"
+#include "git/git.h"
 #include "solver.h"
 
 #include <getopt.h>

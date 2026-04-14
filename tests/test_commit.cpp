@@ -14,7 +14,7 @@
 //   - payload() round-trips through "commit <size>\0" + payload
 //   - Original headers are preserved
 
-#include "commit.h"
+#include "git/commit.h"
 
 #include <cstring>
 #include <iostream>

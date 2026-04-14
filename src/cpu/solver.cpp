@@ -6,7 +6,7 @@
 //   3. AVX2:     8-way SIMD SHA1 using 256-bit registers (universal fallback)
 
 #include "solver.h"
-#include "cpu_solver_common.h"
+#include "cpu/common.h"
 
 #include <chrono>
 #include <cstdio>

@@ -1,6 +1,6 @@
 // cpu_solver_avx512.cpp - AVX-512 backend: 16-way parallel SHA1
 
-#include "cpu_solver_common.h"
+#include "cpu/common.h"
 #include <immintrin.h>
 #include <atomic>
 

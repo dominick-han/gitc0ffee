@@ -1,7 +1,7 @@
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
 
-#include "solver.h"
+#include "../solver.h"
 #include "shader_source.h"
 
 #include <chrono>

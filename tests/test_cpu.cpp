@@ -3,7 +3,7 @@
 // Mirrors test_gpu.mm: verifies that solve() finds correct SHA1
 // prefix matches for various prefix lengths and commit shapes.
 
-#include "commit.h"
+#include "git/commit.h"
 #include "solver.h"
 
 #include <cstdio>

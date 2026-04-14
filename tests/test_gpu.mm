@@ -7,7 +7,7 @@
 //   - Verifies the returned hash starts with the prefix
 //   - Verifies the hash matches CPU SHA1 of the salted object
 
-#include "commit.h"
+#include "git/commit.h"
 #include "solver.h"
 
 #include <cstdio>

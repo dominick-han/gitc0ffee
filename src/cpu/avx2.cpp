@@ -1,6 +1,6 @@
 // cpu_solver_avx2.cpp - AVX2 backend: 8-way parallel SHA1
 
-#include "cpu_solver_common.h"
+#include "cpu/common.h"
 #include <immintrin.h>
 #include <atomic>
 

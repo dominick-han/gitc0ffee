@@ -1,6 +1,6 @@
 // cpu_solver_shani.cpp - SHA-NI backend: 4-way interleaved SHA1
 
-#include "cpu_solver_common.h"
+#include "cpu/common.h"
 #include <immintrin.h>
 #include <atomic>
 
