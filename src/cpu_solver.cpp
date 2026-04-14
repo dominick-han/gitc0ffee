@@ -1,18 +1,23 @@
-// cpu_solver.cpp - multi-threaded SHA1 brute-force using x86 SHA-NI
+// cpu_solver.cpp - multi-threaded SHA1 brute-force with runtime dispatch
+//
+// Two backends:
+//   1. AVX-512:  16-way SIMD SHA1 using 512-bit registers (preferred)
+//   2. SHA-NI:   4-way interleaved using x86 SHA extensions (fallback)
+//
+// Runtime CPUID check selects the fastest available path.
 //
 // Each worker thread owns a contiguous salt range and runs autonomously.
 // No barriers, no batching, no shared counters. The only cross-thread
 // synchronization is a single atomic<bool> for early termination.
-// Scales from 4 cores to 192+.
 //
-// Per-hash optimizations:
-//   - Salt encoded via nibble LUT directly to big-endian SHA1 words
-//   - Incremental: MSG0/MSG1 recomputed every 65536 salts, MSG2 every iter
-//   - 4-way interleaved SHA1 to fully saturate SHA-NI pipeline
-//     (sha1rnds4 has 5c latency / 1c throughput - need 4+ streams)
-//   - Pre-shuffled mask/target to avoid per-hash ABCD shuffle
-//   - Deferred E computation: only finalize E on prefix match (~0.01% of hashes)
-//   - Per-thread hash counters (no atomic contention for progress)
+// AVX-512 optimizations:
+//   - _mm512_rol_epi32 for native rotate (1 uop vs 2 for shift+or)
+//   - _mm512_ternarylogic_epi32 for Ch/Parity/Maj (1 uop vs 3-4)
+//   - Two-level salt loop: words 0-7 recomputed every 65536 salts,
+//     words 8-11 every 16 salts (matches SHA-NI incremental strategy)
+//   - Rolling 16-element W window instead of W[80] (no stack spill)
+//   - Deferred b/c/d/e finalization (only compute on h0 prefix match)
+//   - Fully unrolled 80 rounds with interleaved message schedule
 
 #include "solver.h"
 
@@ -26,6 +31,7 @@
 #include <vector>
 #ifdef __linux__
 #include <sched.h>
+#include <cpuid.h>
 #endif
 
 static constexpr int kSaltBytes = 48;
@@ -46,7 +52,25 @@ static constexpr uint32_t salt_lut[16] = {
 };
 
 // ---------------------------------------------------------------------------
-// Precompute
+// CPU feature detection
+// ---------------------------------------------------------------------------
+
+enum class CpuBackend { SHA_NI, AVX512 };
+
+static CpuBackend detect_backend() {
+#if defined(__x86_64__) && defined(__linux__)
+    unsigned eax, ebx, ecx, edx;
+    if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) {
+        bool avx512f  = (ebx >> 16) & 1;
+        bool avx512bw = (ebx >> 30) & 1;
+        if (avx512f && avx512bw) return CpuBackend::AVX512;
+    }
+#endif
+    return CpuBackend::SHA_NI;
+}
+
+// ---------------------------------------------------------------------------
+// Shared precompute
 // ---------------------------------------------------------------------------
 
 struct CPUParams {
@@ -55,13 +79,13 @@ struct CPUParams {
     uint32_t prefix_words[5];
     uint32_t mask0, target0;
     uint32_t mask1, target1;
-    // Pre-shuffled mask/target in SHA-NI internal DCBA order (avoids per-hash shuffle)
-    uint32_t mask0_shuf, target0_shuf;   // matches element 3 of un-shuffled ABCD
-    uint32_t mask1_shuf, target1_shuf;   // matches element 2 of un-shuffled ABCD
+    uint32_t mask0_shuf, target0_shuf;
+    uint32_t mask1_shuf, target1_shuf;
     __m128i msg3_const;
     alignas(16) uint8_t block[64];
     int salt_off_in_block;
     bool salt_at_block_start;
+    uint32_t msg_words[16];
 };
 
 __attribute__((target("sha,sse4.1,ssse3")))
@@ -82,13 +106,8 @@ static CPUParams precompute(const ObjectTemplate& tpl, const std::string& prefix
         p.target1 = p.prefix_words[1] & p.mask1;
     }
 
-    // SHA-NI stores ABCD in DCBA order internally (reversed by 0x1B shuffle).
-    // Pre-shuffle mask/target so we can check directly without shuffling ABCD.
-    // In the un-shuffled register: element 3 = A (h0), element 2 = B (h1).
-    p.mask0_shuf = p.mask0;
-    p.target0_shuf = p.target0;
-    p.mask1_shuf = p.mask1;
-    p.target1_shuf = p.target1;
+    p.mask0_shuf = p.mask0;   p.target0_shuf = p.target0;
+    p.mask1_shuf = p.mask1;   p.target1_shuf = p.target1;
 
     uint32_t total = static_cast<uint32_t>(tpl.bytes.size());
     int bb = (tpl.salt_offset / 64) * 64;
@@ -110,6 +129,12 @@ static CPUParams precompute(const ObjectTemplate& tpl, const std::string& prefix
 
     p.salt_at_block_start = (p.salt_off_in_block == 0);
 
+    for (int i = 0; i < 16; ++i) {
+        int o = i * 4;
+        p.msg_words[i] = (uint32_t(p.block[o]) << 24) | (uint32_t(p.block[o+1]) << 16) |
+                          (uint32_t(p.block[o+2]) << 8) | uint32_t(p.block[o+3]);
+    }
+
     uint32_t tw[4];
     for (int i = 0; i < 4; ++i) {
         int o = (12 + i) * 4;
@@ -121,9 +146,267 @@ static CPUParams precompute(const ObjectTemplate& tpl, const std::string& prefix
     return p;
 }
 
-// ---------------------------------------------------------------------------
-// SHA1 block from raw bytes (fallback for non-aligned salt offset)
-// ---------------------------------------------------------------------------
+struct alignas(64) WorkerResult {
+    uint64_t salt;
+    uint32_t hash[5];
+    bool found;
+    volatile uint64_t hashes;
+    char _pad[64 - sizeof(uint64_t) - sizeof(uint32_t)*5 - sizeof(bool) - sizeof(uint64_t)];
+};
+
+// ===========================================================================
+// AVX-512 BACKEND: 16-way parallel SHA1 using 512-bit SIMD
+//
+// Register pressure strategy: store W[16] in an aligned stack array.
+// Only 5 state regs (a-e) + 1 temp (f) + current W + K live in zmm.
+// The W array lives in L1 cache and reloads are ~4 cycles (pipelined).
+// This eliminates the 54+ zmm spills the compiler was generating when
+// trying to keep everything in registers.
+// ===========================================================================
+
+#ifdef __x86_64__
+
+static constexpr uint32_t SHA1_K[4] = {0x5A827999u, 0x6ED9EBA1u, 0x8F1BBCDCu, 0xCA62C1D6u};
+
+// SHA1 round: reads W[idx] from stack array, adds K, does the round.
+#define AVX512_ROUND_W(a, b, c, d, e, f, Warr, idx, Kv) do { \
+    __m512i _kw = _mm512_add_epi32(Kv, Warr[idx]); \
+    __m512i _t = _mm512_add_epi32(_mm512_add_epi32(_mm512_rol_epi32(a, 5), f), \
+                                   _mm512_add_epi32(e, _kw)); \
+    e = d; d = c; c = _mm512_rol_epi32(b, 30); b = a; a = _t; \
+} while(0)
+
+// Message schedule expansion into W array
+#define AVX512_EXPAND(W, i) do { \
+    __m512i _x = _mm512_ternarylogic_epi32(W[(i-3)&15], W[(i-8)&15], W[(i-14)&15], 0x96); \
+    W[(i)&15] = _mm512_rol_epi32(_mm512_xor_si512(_x, W[(i-16)&15]), 1); \
+} while(0)
+
+// Expand + round combined: expand W[i], then do round reading W[(i)&15]
+#define AVX512_EROUND(W, i, a, b, c, d, e, fn, Kv) do { \
+    AVX512_EXPAND(W, i); \
+    __m512i _f = fn(b,c,d); \
+    AVX512_ROUND_W(a, b, c, d, e, _f, W, (i)&15, Kv); \
+} while(0)
+
+__attribute__((target("avx512f,avx512bw")))
+static void avx512_worker(const CPUParams& p, uint64_t salt_start, uint64_t salt_end,
+                           std::atomic<bool>& global_found, WorkerResult& result) {
+    result.found = false;
+    result.hashes = 0;
+
+    if (!p.salt_at_block_start) return;
+
+    const __m512i INIT_A = _mm512_set1_epi32((int)p.pre_state[0]);
+    const __m512i INIT_B = _mm512_set1_epi32((int)p.pre_state[1]);
+    const __m512i INIT_C = _mm512_set1_epi32((int)p.pre_state[2]);
+    const __m512i INIT_D = _mm512_set1_epi32((int)p.pre_state[3]);
+    const __m512i INIT_E = _mm512_set1_epi32((int)p.pre_state[4]);
+
+    const __m512i VK0 = _mm512_set1_epi32((int)SHA1_K[0]);
+    const __m512i VK1 = _mm512_set1_epi32((int)SHA1_K[1]);
+    const __m512i VK2 = _mm512_set1_epi32((int)SHA1_K[2]);
+    const __m512i VK3 = _mm512_set1_epi32((int)SHA1_K[3]);
+
+    const __m512i W12_C = _mm512_set1_epi32((int)p.msg_words[12]);
+    const __m512i W13_C = _mm512_set1_epi32((int)p.msg_words[13]);
+    const __m512i W14_C = _mm512_set1_epi32((int)p.msg_words[14]);
+    const __m512i W15_C = _mm512_set1_epi32((int)p.msg_words[15]);
+
+    const __m512i vmask0 = _mm512_set1_epi32((int)p.mask0);
+    const __m512i vtarget0 = _mm512_set1_epi32((int)p.target0);
+    const __m512i vmask1 = _mm512_set1_epi32((int)p.mask1);
+    const __m512i vtarget1 = _mm512_set1_epi32((int)p.target1);
+    const uint32_t pn = p.prefix_len;
+
+    const __m512i SALT_LUT = _mm512_loadu_si512((const __m512i*)salt_lut);
+    const __m512i NIBBLE_MASK = _mm512_set1_epi32(0xF);
+    const __m512i LANE_IDS = _mm512_setr_epi32(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15);
+
+    #define CH(b,c,d) _mm512_ternarylogic_epi32(b,c,d,0xCA)
+    #define PA(b,c,d) _mm512_ternarylogic_epi32(b,c,d,0x96)
+    #define MA(b,c,d) _mm512_ternarylogic_epi32(b,c,d,0xE8)
+
+    uint64_t salt = salt_start;
+
+    while (salt < salt_end) {
+        // Outer loop: words 0-7 uniform (high nibbles identical for 65536 salts)
+        __m512i W0_base = _mm512_set1_epi32((int)salt_lut[(salt >> 44) & 0xF]);
+        __m512i W1_base = _mm512_set1_epi32((int)salt_lut[(salt >> 40) & 0xF]);
+        __m512i W2_base = _mm512_set1_epi32((int)salt_lut[(salt >> 36) & 0xF]);
+        __m512i W3_base = _mm512_set1_epi32((int)salt_lut[(salt >> 32) & 0xF]);
+        __m512i W4_base = _mm512_set1_epi32((int)salt_lut[(salt >> 28) & 0xF]);
+        __m512i W5_base = _mm512_set1_epi32((int)salt_lut[(salt >> 24) & 0xF]);
+        __m512i W6_base = _mm512_set1_epi32((int)salt_lut[(salt >> 20) & 0xF]);
+        __m512i W7_base = _mm512_set1_epi32((int)salt_lut[(salt >> 16) & 0xF]);
+
+        uint64_t inner_end = (salt | 0xFFFF) + 1;
+        if (inner_end > salt_end) inner_end = salt_end;
+
+        if (global_found.load(std::memory_order_relaxed)) return;
+
+        for (uint64_t s = salt; s + 16 <= inner_end; s += 16) {
+            // SIMD salt LUT lookup
+            __m512i sv = _mm512_add_epi32(_mm512_set1_epi32((int)s), LANE_IDS);
+            __m512i W8_v  = _mm512_permutexvar_epi32(_mm512_and_si512(_mm512_srli_epi32(sv, 12), NIBBLE_MASK), SALT_LUT);
+            __m512i W9_v  = _mm512_permutexvar_epi32(_mm512_and_si512(_mm512_srli_epi32(sv, 8), NIBBLE_MASK), SALT_LUT);
+            __m512i W10_v = _mm512_permutexvar_epi32(_mm512_and_si512(_mm512_srli_epi32(sv, 4), NIBBLE_MASK), SALT_LUT);
+            __m512i W11_v = _mm512_permutexvar_epi32(_mm512_and_si512(sv, NIBBLE_MASK), SALT_LUT);
+
+            // W array on stack — compiler keeps hot values in regs, spills cold ones
+            alignas(64) __m512i W[16];
+            W[0]=W0_base; W[1]=W1_base; W[2]=W2_base; W[3]=W3_base;
+            W[4]=W4_base; W[5]=W5_base; W[6]=W6_base; W[7]=W7_base;
+            W[8]=W8_v; W[9]=W9_v; W[10]=W10_v; W[11]=W11_v;
+            W[12]=W12_C; W[13]=W13_C; W[14]=W14_C; W[15]=W15_C;
+
+            __m512i a = INIT_A, b = INIT_B, c = INIT_C, d = INIT_D, e = INIT_E;
+            __m512i f;
+
+            // All 80 rounds use AVX512_ROUND_W which reads W[i] from the stack
+            // array and adds K inline. This keeps register pressure minimal:
+            // only a,b,c,d,e + f + 1 kw temp = 7 zmm for rounds, leaving 25
+            // for the compiler to manage W[], K constants, and loop vars.
+
+            // Rounds 0-15: Ch
+            f=CH(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,0,VK0);
+            f=CH(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,1,VK0);
+            f=CH(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,2,VK0);
+            f=CH(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,3,VK0);
+            f=CH(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,4,VK0);
+            f=CH(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,5,VK0);
+            f=CH(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,6,VK0);
+            f=CH(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,7,VK0);
+            f=CH(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,8,VK0);
+            f=CH(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,9,VK0);
+            f=CH(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,10,VK0);
+            f=CH(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,11,VK0);
+            f=CH(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,12,VK0);
+            f=CH(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,13,VK0);
+            f=CH(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,14,VK0);
+            f=CH(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,15,VK0);
+
+            // Rounds 16-19: Ch
+            AVX512_EROUND(W,16,a,b,c,d,e,CH,VK0);
+            AVX512_EROUND(W,17,a,b,c,d,e,CH,VK0);
+            AVX512_EROUND(W,18,a,b,c,d,e,CH,VK0);
+            AVX512_EROUND(W,19,a,b,c,d,e,CH,VK0);
+
+            // Rounds 20-39: Parity
+            AVX512_EROUND(W,20,a,b,c,d,e,PA,VK1);
+            AVX512_EROUND(W,21,a,b,c,d,e,PA,VK1);
+            AVX512_EROUND(W,22,a,b,c,d,e,PA,VK1);
+            AVX512_EROUND(W,23,a,b,c,d,e,PA,VK1);
+            AVX512_EROUND(W,24,a,b,c,d,e,PA,VK1);
+            AVX512_EROUND(W,25,a,b,c,d,e,PA,VK1);
+            AVX512_EROUND(W,26,a,b,c,d,e,PA,VK1);
+            AVX512_EROUND(W,27,a,b,c,d,e,PA,VK1);
+            AVX512_EROUND(W,28,a,b,c,d,e,PA,VK1);
+            AVX512_EROUND(W,29,a,b,c,d,e,PA,VK1);
+            AVX512_EROUND(W,30,a,b,c,d,e,PA,VK1);
+            AVX512_EROUND(W,31,a,b,c,d,e,PA,VK1);
+            AVX512_EROUND(W,32,a,b,c,d,e,PA,VK1);
+            AVX512_EROUND(W,33,a,b,c,d,e,PA,VK1);
+            AVX512_EROUND(W,34,a,b,c,d,e,PA,VK1);
+            AVX512_EROUND(W,35,a,b,c,d,e,PA,VK1);
+            AVX512_EROUND(W,36,a,b,c,d,e,PA,VK1);
+            AVX512_EROUND(W,37,a,b,c,d,e,PA,VK1);
+            AVX512_EROUND(W,38,a,b,c,d,e,PA,VK1);
+            AVX512_EROUND(W,39,a,b,c,d,e,PA,VK1);
+
+            // Rounds 40-59: Maj
+            AVX512_EROUND(W,40,a,b,c,d,e,MA,VK2);
+            AVX512_EROUND(W,41,a,b,c,d,e,MA,VK2);
+            AVX512_EROUND(W,42,a,b,c,d,e,MA,VK2);
+            AVX512_EROUND(W,43,a,b,c,d,e,MA,VK2);
+            AVX512_EROUND(W,44,a,b,c,d,e,MA,VK2);
+            AVX512_EROUND(W,45,a,b,c,d,e,MA,VK2);
+            AVX512_EROUND(W,46,a,b,c,d,e,MA,VK2);
+            AVX512_EROUND(W,47,a,b,c,d,e,MA,VK2);
+            AVX512_EROUND(W,48,a,b,c,d,e,MA,VK2);
+            AVX512_EROUND(W,49,a,b,c,d,e,MA,VK2);
+            AVX512_EROUND(W,50,a,b,c,d,e,MA,VK2);
+            AVX512_EROUND(W,51,a,b,c,d,e,MA,VK2);
+            AVX512_EROUND(W,52,a,b,c,d,e,MA,VK2);
+            AVX512_EROUND(W,53,a,b,c,d,e,MA,VK2);
+            AVX512_EROUND(W,54,a,b,c,d,e,MA,VK2);
+            AVX512_EROUND(W,55,a,b,c,d,e,MA,VK2);
+            AVX512_EROUND(W,56,a,b,c,d,e,MA,VK2);
+            AVX512_EROUND(W,57,a,b,c,d,e,MA,VK2);
+            AVX512_EROUND(W,58,a,b,c,d,e,MA,VK2);
+            AVX512_EROUND(W,59,a,b,c,d,e,MA,VK2);
+
+            // Rounds 60-79: Parity
+            AVX512_EROUND(W,60,a,b,c,d,e,PA,VK3);
+            AVX512_EROUND(W,61,a,b,c,d,e,PA,VK3);
+            AVX512_EROUND(W,62,a,b,c,d,e,PA,VK3);
+            AVX512_EROUND(W,63,a,b,c,d,e,PA,VK3);
+            AVX512_EROUND(W,64,a,b,c,d,e,PA,VK3);
+            AVX512_EROUND(W,65,a,b,c,d,e,PA,VK3);
+            AVX512_EROUND(W,66,a,b,c,d,e,PA,VK3);
+            AVX512_EROUND(W,67,a,b,c,d,e,PA,VK3);
+            AVX512_EROUND(W,68,a,b,c,d,e,PA,VK3);
+            AVX512_EROUND(W,69,a,b,c,d,e,PA,VK3);
+            AVX512_EROUND(W,70,a,b,c,d,e,PA,VK3);
+            AVX512_EROUND(W,71,a,b,c,d,e,PA,VK3);
+            AVX512_EROUND(W,72,a,b,c,d,e,PA,VK3);
+            AVX512_EROUND(W,73,a,b,c,d,e,PA,VK3);
+            AVX512_EROUND(W,74,a,b,c,d,e,PA,VK3);
+            AVX512_EROUND(W,75,a,b,c,d,e,PA,VK3);
+            AVX512_EROUND(W,76,a,b,c,d,e,PA,VK3);
+            AVX512_EROUND(W,77,a,b,c,d,e,PA,VK3);
+            AVX512_EROUND(W,78,a,b,c,d,e,PA,VK3);
+            AVX512_EROUND(W,79,a,b,c,d,e,PA,VK3);
+
+            // Deferred finalization: only add INIT_A, check h0
+            a = _mm512_add_epi32(a, INIT_A);
+            __mmask16 match = _mm512_cmpeq_epi32_mask(_mm512_and_si512(a, vmask0), vtarget0);
+
+            if (__builtin_expect(match != 0, 0)) {
+                b = _mm512_add_epi32(b, INIT_B);
+                if (pn > 8)
+                    match &= _mm512_cmpeq_epi32_mask(_mm512_and_si512(b, vmask1), vtarget1);
+                if (match != 0) {
+                    c = _mm512_add_epi32(c, INIT_C);
+                    d = _mm512_add_epi32(d, INIT_D);
+                    e = _mm512_add_epi32(e, INIT_E);
+
+                    alignas(64) uint32_t ha[16], hb[16], hc[16], hd[16], he[16];
+                    _mm512_store_si512((__m512i*)ha, a);
+                    _mm512_store_si512((__m512i*)hb, b);
+                    _mm512_store_si512((__m512i*)hc, c);
+                    _mm512_store_si512((__m512i*)hd, d);
+                    _mm512_store_si512((__m512i*)he, e);
+
+                    int lane = __builtin_ctz(match);
+                    result.salt = s + lane;
+                    result.hash[0] = ha[lane]; result.hash[1] = hb[lane];
+                    result.hash[2] = hc[lane]; result.hash[3] = hd[lane];
+                    result.hash[4] = he[lane];
+                    result.found = true;
+                    result.hashes = s + lane - salt_start + 1;
+                    global_found.store(true, std::memory_order_relaxed);
+                    return;
+                }
+            }
+        }
+
+        result.hashes = inner_end - salt_start;
+        salt = inner_end;
+    }
+
+    #undef CH
+    #undef PA
+    #undef MA
+
+    result.hashes = salt_end - salt_start;
+}
+
+#endif // __x86_64__
+
+// ===========================================================================
+// SHA-NI BACKEND: 4-way interleaved SHA1 using x86 SHA extensions
+// ===========================================================================
 
 __attribute__((target("sha,sse4.1,ssse3")))
 static void sha1_block_shani(const uint8_t data[64], const uint32_t init[5],
@@ -164,39 +447,20 @@ static void sha1_block_shani(const uint8_t data[64], const uint32_t init[5],
     out[4]=(uint32_t)_mm_extract_epi32(E0,3);
 }
 
-// ---------------------------------------------------------------------------
-// 4-way interleaved SHA1 round macros.
-//
-// SHA-NI sha1rnds4 has 5-cycle latency but 1-cycle throughput.
-// With 4 independent hash streams (a,b,c,d), we issue a sha1rnds4 every
-// cycle across streams, completely hiding the latency pipeline bubble.
-// This is the single biggest throughput win over the previous 2-way design.
-//
-// P is the stream prefix: a, b, c, or d.
-// ---------------------------------------------------------------------------
-
-// Rounds 0-3: init E, first rnds4
 #define R0_3(P)   P##E=_mm_add_epi32(P##E,P##M0);P##E1=P##A;P##A=_mm_sha1rnds4_epu32(P##A,P##E,0);
-// Rounds 4-7
 #define R4_7(P)   P##E1=_mm_sha1nexte_epu32(P##E1,P##M1);P##E=P##A;P##A=_mm_sha1rnds4_epu32(P##A,P##E1,0);P##M0=_mm_sha1msg1_epu32(P##M0,P##M1);
-// Rounds 8-11
 #define R8_11(P)  P##E=_mm_sha1nexte_epu32(P##E,P##M2);P##E1=P##A;P##A=_mm_sha1rnds4_epu32(P##A,P##E,0);P##M1=_mm_sha1msg1_epu32(P##M1,P##M2);P##M0=_mm_xor_si128(P##M0,P##M2);
-// Rounds 12-15
 #define R12_15(P) P##E1=_mm_sha1nexte_epu32(P##E1,P##M3);P##E=P##A;P##M0=_mm_sha1msg2_epu32(P##M0,P##M3);P##A=_mm_sha1rnds4_epu32(P##A,P##E1,0);P##M2=_mm_sha1msg1_epu32(P##M2,P##M3);P##M1=_mm_xor_si128(P##M1,P##M3);
-// Generic even/odd round groups with msg schedule
 #define RE(P,fn) P##E=_mm_sha1nexte_epu32(P##E,P##M0);P##E1=P##A;P##M1=_mm_sha1msg2_epu32(P##M1,P##M0);P##A=_mm_sha1rnds4_epu32(P##A,P##E,fn);P##M3=_mm_sha1msg1_epu32(P##M3,P##M0);P##M2=_mm_xor_si128(P##M2,P##M0);
 #define RO(P,fn) P##E1=_mm_sha1nexte_epu32(P##E1,P##M1);P##E=P##A;P##M2=_mm_sha1msg2_epu32(P##M2,P##M1);P##A=_mm_sha1rnds4_epu32(P##A,P##E1,fn);P##M0=_mm_sha1msg1_epu32(P##M0,P##M1);P##M3=_mm_xor_si128(P##M3,P##M1);
 #define RE2(P,fn) P##E=_mm_sha1nexte_epu32(P##E,P##M2);P##E1=P##A;P##M3=_mm_sha1msg2_epu32(P##M3,P##M2);P##A=_mm_sha1rnds4_epu32(P##A,P##E,fn);P##M1=_mm_sha1msg1_epu32(P##M1,P##M2);P##M0=_mm_xor_si128(P##M0,P##M2);
 #define RO2(P,fn) P##E1=_mm_sha1nexte_epu32(P##E1,P##M3);P##E=P##A;P##M0=_mm_sha1msg2_epu32(P##M0,P##M3);P##A=_mm_sha1rnds4_epu32(P##A,P##E1,fn);P##M2=_mm_sha1msg1_epu32(P##M2,P##M3);P##M1=_mm_xor_si128(P##M1,P##M3);
-// Final rounds (no more msg schedule needed)
 #define R64(P) P##E=_mm_sha1nexte_epu32(P##E,P##M0);P##E1=P##A;P##M1=_mm_sha1msg2_epu32(P##M1,P##M0);P##A=_mm_sha1rnds4_epu32(P##A,P##E,3);P##M3=_mm_sha1msg1_epu32(P##M3,P##M0);P##M2=_mm_xor_si128(P##M2,P##M0);
 #define R68(P) P##E1=_mm_sha1nexte_epu32(P##E1,P##M1);P##E=P##A;P##M2=_mm_sha1msg2_epu32(P##M2,P##M1);P##A=_mm_sha1rnds4_epu32(P##A,P##E1,3);P##M3=_mm_xor_si128(P##M3,P##M1);
 #define R72(P) P##E=_mm_sha1nexte_epu32(P##E,P##M2);P##E1=P##A;P##M3=_mm_sha1msg2_epu32(P##M3,P##M2);P##A=_mm_sha1rnds4_epu32(P##A,P##E,3);
 #define R76(P) P##E1=_mm_sha1nexte_epu32(P##E1,P##M3);P##E=P##A;P##A=_mm_sha1rnds4_epu32(P##A,P##E1,3);
-// Finalize ABCD only (deferred E - only compute E on prefix match)
 #define RFIN_ABCD(P) P##A=_mm_add_epi32(P##A,ABCD_INIT);
 
-// SHA1 rounds macro for single-hash path (leftover)
 #define SHA1_80(M0,M1,M2,M3,AI,EI,AS,ES,ABCD,E0,E1) \
     ABCD=AI;E0=EI;AS=ABCD;ES=E0; \
     E0=_mm_add_epi32(E0,M0);E1=ABCD;ABCD=_mm_sha1rnds4_epu32(ABCD,E0,0); \
@@ -221,22 +485,6 @@ static void sha1_block_shani(const uint8_t data[64], const uint32_t init[5],
     E1=_mm_sha1nexte_epu32(E1,M3);E0=ABCD;ABCD=_mm_sha1rnds4_epu32(ABCD,E1,3); \
     E0=_mm_sha1nexte_epu32(E0,ES);ABCD=_mm_add_epi32(ABCD,AS);
 
-// ---------------------------------------------------------------------------
-// Worker - each thread owns a salt range, runs autonomously until done.
-// Progress tracked via per-thread counter in WorkerResult (no atomics).
-// ---------------------------------------------------------------------------
-
-struct alignas(64) WorkerResult {
-    uint64_t salt;
-    uint32_t hash[5];
-    bool found;
-    volatile uint64_t hashes;  // written by worker, read by main - no atomic needed
-    char _pad[64 - sizeof(uint64_t) - sizeof(uint32_t)*5 - sizeof(bool) - sizeof(uint64_t)];
-};
-
-// Check prefix match on un-shuffled ABCD (SHA-NI internal DCBA order).
-// Element 3 = A (h0), element 2 = B (h1).
-// Returns true if prefix matches. If so, fills result and signals global_found.
 __attribute__((target("sha,sse4.1,ssse3")))
 static inline bool check_and_store(__m128i A, __m128i E_before_fin, __m128i E0_INIT,
                                    __m128i /*ABCD_INIT*/,
@@ -246,12 +494,10 @@ static inline bool check_and_store(__m128i A, __m128i E_before_fin, __m128i E0_I
                                    uint64_t salt_start,
                                    std::atomic<bool>& global_found,
                                    WorkerResult& result) {
-    // ABCD is in DCBA order. Shuffle to ABCD for output.
     __m128i ABCD_out = _mm_shuffle_epi32(A, 0x1B);
     uint32_t h0 = (uint32_t)_mm_extract_epi32(ABCD_out, 0);
     if (__builtin_expect((h0 & mask0) == target0, 0)) {
         if (pn <= 8 || ((uint32_t)_mm_extract_epi32(ABCD_out, 1) & mask1) == target1) {
-            // Deferred E finalization - only on match
             __m128i E_final = _mm_sha1nexte_epu32(E_before_fin, E0_INIT);
             result.salt = salt;
             _mm_storeu_si128((__m128i*)result.hash, ABCD_out);
@@ -266,8 +512,8 @@ static inline bool check_and_store(__m128i A, __m128i E_before_fin, __m128i E0_I
 }
 
 __attribute__((target("sha,sse4.1,ssse3")))
-static void worker(const CPUParams& p, uint64_t salt_start, uint64_t salt_end,
-                   std::atomic<bool>& global_found, WorkerResult& result) {
+static void shani_worker(const CPUParams& p, uint64_t salt_start, uint64_t salt_end,
+                          std::atomic<bool>& global_found, WorkerResult& result) {
     result.found = false;
     result.hashes = 0;
 
@@ -295,13 +541,10 @@ static void worker(const CPUParams& p, uint64_t salt_start, uint64_t salt_end,
 
             if (global_found.load(std::memory_order_relaxed)) return;
 
-            // 4-way interleaved: process 4 salts simultaneously to fully
-            // saturate the SHA-NI pipeline (5c latency / 1c throughput).
             uint64_t s = salt;
             uint64_t quad_end = s + ((inner_end - s) & ~3ULL);
 
             for (; s < quad_end; s += 4) {
-                // Set up 4 independent message streams - only M2 differs per salt
                 __m128i aM0=M0_base,aM1=M1_base,aM3=MSG3_C;
                 __m128i bM0=M0_base,bM1=M1_base,bM3=MSG3_C;
                 __m128i cM0=M0_base,cM1=M1_base,cM3=MSG3_C;
@@ -320,43 +563,34 @@ static void worker(const CPUParams& p, uint64_t salt_start, uint64_t salt_end,
                 __m128i cA=ABCD_INIT,cE=E0_INIT,cE1;
                 __m128i dA=ABCD_INIT,dE=E0_INIT,dE1;
 
-                // Rounds 0-15
                 R0_3(a) R0_3(b) R0_3(c) R0_3(d)
                 R4_7(a) R4_7(b) R4_7(c) R4_7(d)
                 R8_11(a) R8_11(b) R8_11(c) R8_11(d)
                 R12_15(a) R12_15(b) R12_15(c) R12_15(d)
-                // Rounds 16-31 (fn changes 0->1 at round 20)
                 RE(a,0) RE(b,0) RE(c,0) RE(d,0)
                 RO(a,1) RO(b,1) RO(c,1) RO(d,1)
                 RE2(a,1) RE2(b,1) RE2(c,1) RE2(d,1)
                 RO2(a,1) RO2(b,1) RO2(c,1) RO2(d,1)
-                // Rounds 32-47 (fn changes 1->2 at round 40)
                 RE(a,1) RE(b,1) RE(c,1) RE(d,1)
                 RO(a,1) RO(b,1) RO(c,1) RO(d,1)
                 RE2(a,2) RE2(b,2) RE2(c,2) RE2(d,2)
                 RO2(a,2) RO2(b,2) RO2(c,2) RO2(d,2)
-                // Rounds 48-63 (fn changes 2->3 at round 60)
                 RE(a,2) RE(b,2) RE(c,2) RE(d,2)
                 RO(a,2) RO(b,2) RO(c,2) RO(d,2)
                 RE2(a,2) RE2(b,2) RE2(c,2) RE2(d,2)
                 RO2(a,3) RO2(b,3) RO2(c,3) RO2(d,3)
-                // Rounds 64-79 (final, no more msg schedule)
                 R64(a) R64(b) R64(c) R64(d)
                 R68(a) R68(b) R68(c) R68(d)
                 R72(a) R72(b) R72(c) R72(d)
                 R76(a) R76(b) R76(c) R76(d)
-                // Finalize ABCD only (defer E computation to match check)
                 RFIN_ABCD(a) RFIN_ABCD(b) RFIN_ABCD(c) RFIN_ABCD(d)
 
-                // Check all 4 results. ABCD is still in DCBA order.
-                // check_and_store handles shuffle + deferred E finalization.
                 if (check_and_store(aA, aE, E0_INIT, ABCD_INIT, mask0, target0, mask1, target1, pn, s,   salt_start, global_found, result)) return;
                 if (check_and_store(bA, bE, E0_INIT, ABCD_INIT, mask0, target0, mask1, target1, pn, s+1, salt_start, global_found, result)) return;
                 if (check_and_store(cA, cE, E0_INIT, ABCD_INIT, mask0, target0, mask1, target1, pn, s+2, salt_start, global_found, result)) return;
                 if (check_and_store(dA, dE, E0_INIT, ABCD_INIT, mask0, target0, mask1, target1, pn, s+3, salt_start, global_found, result)) return;
             }
 
-            // Handle 1-3 leftover salts
             for (; s < inner_end; ++s) {
                 __m128i M0=M0_base,M1=M1_base,M3=MSG3_C;
                 __m128i M2=_mm_set_epi32((int)salt_lut[(s>>12)&0xF],(int)salt_lut[(s>>8)&0xF],(int)salt_lut[(s>>4)&0xF],(int)salt_lut[s&0xF]);
@@ -374,8 +608,6 @@ static void worker(const CPUParams& p, uint64_t salt_start, uint64_t salt_end,
                 }
             }
             salt = s;
-
-            // Update counter every 65536 hashes - main thread reads this for progress
             result.hashes = salt - salt_start;
         }
     } else {
@@ -410,12 +642,26 @@ static void worker(const CPUParams& p, uint64_t salt_start, uint64_t salt_end,
 }
 
 // ---------------------------------------------------------------------------
-// Public API
+// Public API - runtime dispatch between AVX-512 and SHA-NI
 // ---------------------------------------------------------------------------
+
+using WorkerFn = void(*)(const CPUParams&, uint64_t, uint64_t,
+                          std::atomic<bool>&, WorkerResult&);
 
 std::optional<SolveResult> solve(const ObjectTemplate& tpl,
                                  const std::string& prefix_hex) {
     CPUParams params = precompute(tpl, prefix_hex);
+
+    CpuBackend backend = detect_backend();
+    const char* backend_name = "SHA-NI, 4-way";
+    WorkerFn worker_fn = shani_worker;
+
+#ifdef __x86_64__
+    if (backend == CpuBackend::AVX512 && params.salt_at_block_start) {
+        backend_name = "AVX-512, 16-way";
+        worker_fn = avx512_worker;
+    }
+#endif
 
     unsigned nthreads = std::thread::hardware_concurrency();
     if (nthreads == 0) nthreads = 4;
@@ -433,7 +679,7 @@ std::optional<SolveResult> solve(const ObjectTemplate& tpl,
     static constexpr uint64_t kMaxSalt = (1ULL << 48) - 1;
     uint64_t per_thread = kMaxSalt / nthreads;
 
-    fprintf(stderr, "Device         CPU (%u threads, SHA-NI, 4-way)\n\n", nthreads);
+    fprintf(stderr, "Device         CPU (%u threads, %s)\n\n", nthreads, backend_name);
 
     std::atomic<bool> global_found{false};
     std::vector<WorkerResult> results(nthreads);
@@ -444,11 +690,10 @@ std::optional<SolveResult> solve(const ObjectTemplate& tpl,
     for (unsigned t = 0; t < nthreads; ++t) {
         uint64_t start = uint64_t(t) * per_thread;
         uint64_t end = (t == nthreads - 1) ? kMaxSalt : start + per_thread;
-        threads[t] = std::thread(worker, std::cref(params), start, end,
+        threads[t] = std::thread(worker_fn, std::cref(params), start, end,
                                  std::ref(global_found), std::ref(results[t]));
     }
 
-    // Progress: sum per-thread counters (no contention - each on its own cache line)
     {
         int next_sec = 1;
         while (!global_found.load(std::memory_order_relaxed)) {
@@ -468,12 +713,10 @@ std::optional<SolveResult> solve(const ObjectTemplate& tpl,
 
     for (auto& th : threads) th.join();
 
-    // Sum final hash counts
     uint64_t total_hashes = 0;
     for (unsigned t = 0; t < nthreads; ++t)
         total_hashes += results[t].hashes;
 
-    // Find winner (lowest salt)
     int winner = -1;
     for (unsigned t = 0; t < nthreads; ++t) {
         if (results[t].found) {

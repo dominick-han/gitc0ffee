@@ -12,9 +12,9 @@ Make your commits start with `c0ffee`, `deadbeef`, `badc0de` - or whatever makes
 - OpenSSL 3 (`brew install openssl@3` or build from source)
 - Xcode Command Line Tools (`xcode-select --install`)
 
-### Linux (CPU with SHA-NI)
+### Linux (CPU with SHA-NI or AVX-512)
 
-- x86-64 CPU with SHA-NI extensions (Intel Goldmont+, AMD Zen+)
+- x86-64 CPU with SHA-NI (Intel Goldmont+, AMD Zen+) or AVX-512 (Intel Skylake-X+, AMD Zen 4+)
 - OpenSSL development headers (`libssl-dev` / `openssl-devel`)
 - GCC 10+ with C++20 support
 
@@ -64,7 +64,7 @@ Throughput     8.95 GH/s
 Hashes Tried   0.40G
 ```
 
-### Example output (Linux - CPU SHA-NI)
+### Example output (Linux - CPU AVX-512)
 
 ```
 Target Prefix  deadbeef (8 nibbles)
@@ -72,11 +72,11 @@ Padding        19 bytes (1 SHA1 block)
 Object Size    881 bytes
 Salt Offset    832
 
-Device         CPU (192 threads, SHA-NI)
+Device         CPU (192 threads, AVX-512, 16-way)
 
 Found          deadbeef3f2c6bd3373376c7d821241260274513
-Time           1.01s
-Throughput     11.16 GH/s
+Time           0.52s
+Throughput     21.30 GH/s
 Hashes Tried   11.27G
 ```
 
@@ -97,16 +97,17 @@ Sustained throughput: ~3.6 GH/s.
 | Prefix | Nibbles | Expected hashes | Time |
 |--------|---------|-----------------|------|
 | `c0ffee` | 6 | ~16M | <0.1s |
-| `deadbeef` | 8 | ~4.3B | ~1s |
+| `c0ffeec0` | 8 | ~4.3B | ~0.2s |
+| `c0ffeec0ff` | 10 | ~1.1T | ~1 min |
 
-Sustained throughput: ~14 GH/s with SHA-NI.
+Sustained throughput: ~21 GH/s with AVX-512 (16-way), ~14 GH/s with SHA-NI (4-way). Backend auto-selected at runtime.
 
 ## How it works
 
 1. Read the current HEAD commit.
 2. Append invisible trailing whitespace to the commit message: padding spaces for SHA1 block alignment, followed by a 48-bit salt encoded as spaces (0) and tabs (1).
 3. Pre-compute SHA1 state for all blocks before the salt on the CPU.
-4. On macOS: dispatch millions of GPU threads via Metal compute shaders. On Linux: dispatch across all CPU cores using SHA-NI intrinsics.
+4. On macOS: dispatch millions of GPU threads via Metal compute shaders. On Linux: dispatch across all CPU cores using AVX-512 (16-way SIMD) or SHA-NI intrinsics (4-way), auto-selected at runtime.
 5. Each thread/core tries a different salt, runs 80 SHA1 rounds, and checks the prefix.
 6. Write the winning commit object to the git store.
 7. Optionally update HEAD.
@@ -125,9 +126,11 @@ The salt and padding are completely invisible - they're trailing whitespace that
 - **Fully unrolled shader** - scalar variables with fused message schedule expansion. No arrays, no loops, zero register spill.
 - **Triple-buffered dispatch** - three Metal command buffers in flight for zero GPU idle time.
 
-#### Linux (CPU SHA-NI)
+#### Linux (CPU)
 
-- **Hardware SHA1 acceleration** - uses x86 SHA-NI instructions (`sha1rnds4`, `sha1nexte`, `sha1msg1`, `sha1msg2`) for native SHA1 block processing.
+- **Runtime backend selection** - auto-detects AVX-512 vs SHA-NI at startup via CPUID, picks the fastest available path.
+- **AVX-512 16-way SIMD** - processes 16 independent SHA1 hashes in parallel using 512-bit registers. Uses `vpternlogd` for 1-uop round functions, `vprold` for native rotate, and `vpermd` for SIMD salt LUT lookup.
+- **SHA-NI 4-way interleaved** - four independent SHA1 streams saturate the `sha1rnds4` pipeline (5-cycle latency, 1-cycle throughput). Deferred E computation skips finalization on non-matches.
 - **Nibble LUT salt encoding** - builds SHA1 message words directly from the 48-bit salt via lookup table, skipping byte-level encoding and byte-swap shuffles.
 - **Incremental salt update** - only recomputes the 4 low words each iteration; the 8 high words are reused across 65536 consecutive salts.
 - **Autonomous workers** - each thread owns a contiguous salt range with no synchronization barriers. Scales from 4 cores to 192+.
@@ -148,7 +151,7 @@ src/
   commit.cpp/.h     Commit parsing and template construction
   git.cpp/.h        Git plumbing (rev-parse, cat-file, hash-object)
   metal_solver.mm/.h Metal GPU dispatch and SHA1 pre-computation (macOS)
-  cpu_solver.cpp/.h Multi-threaded SHA-NI brute-force (Linux)
+  cpu_solver.cpp/.h Multi-threaded SHA1 brute-force: AVX-512 16-way + SHA-NI 4-way (Linux)
   sha1.metal        Metal compute shader (SHA1 brute-force kernel)
   types.h           Shared types (HexDigest, ObjectTemplate, SolveResult)
 tests/
