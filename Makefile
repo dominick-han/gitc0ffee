@@ -27,7 +27,7 @@ else
   INCLUDES := -Isrc
   LIBS     := -lcrypto -lpthread
 
-  SRCS_CPP += src/cpu_solver.cpp
+  SRCS_CPP += src/cpu_solver.cpp src/cpu_solver_avx512.cpp src/cpu_solver_sha_ni.cpp src/cpu_solver_avx2.cpp
   OBJS     := $(patsubst src/%.cpp,$(B)/%.o,$(SRCS_CPP))
 endif
 
@@ -79,8 +79,8 @@ test: $(B)/test_commit $(B)/test_gpu $(TARGET)
 	@$(B)/test_gpu
 	@tests/test_e2e.sh $(TARGET)
 else
-$(B)/test_cpu: tests/test_cpu.cpp $(B)/commit.o $(B)/cpu_solver.o | $(B)
-	$(CXX) $(CXXFLAGS) $(INCLUDES) $< $(B)/commit.o $(B)/cpu_solver.o $(LIBS) -o $@
+$(B)/test_cpu: tests/test_cpu.cpp $(B)/commit.o $(B)/cpu_solver.o $(B)/cpu_solver_avx512.o $(B)/cpu_solver_sha_ni.o $(B)/cpu_solver_avx2.o | $(B)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $< $(B)/commit.o $(B)/cpu_solver.o $(B)/cpu_solver_avx512.o $(B)/cpu_solver_sha_ni.o $(B)/cpu_solver_avx2.o $(LIBS) -o $@
 
 test: $(B)/test_commit $(B)/test_cpu $(TARGET)
 	@$(B)/test_commit

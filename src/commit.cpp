@@ -1,4 +1,5 @@
 #include "commit.h"
+#include <cstdlib>
 #include <iostream>
 
 static constexpr int kSaltLen = 48;
@@ -79,17 +80,6 @@ ObjectTemplate prepare_template(const CommitObject& obj) {
         }
     }
 
-    // Fallback: find best 4-byte aligned pad
-    for (int pad = 0; pad <= 512; ++pad) {
-        auto [so, total] = offsets(hdr, msg, pad);
-        if (so % 4 != 0) continue;
-        if (total - (so / 64) * 64 <= 55) {
-            if (pad > 0)
-                std::cerr << "Padding        " << pad << " bytes (1 SHA1 block)\n";
-            return build_template(c, pad);
-        }
-    }
-
-    std::cerr << "Warning: no optimal padding found\n";
-    return build_template(c, 0);
+    std::cerr << "Error: could not align salt to 64-byte block boundary\n";
+    std::exit(1);
 }

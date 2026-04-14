@@ -12,9 +12,9 @@ Make your commits start with `c0ffee`, `deadbeef`, `badc0de` - or whatever makes
 - OpenSSL 3 (`brew install openssl@3` or build from source)
 - Xcode Command Line Tools (`xcode-select --install`)
 
-### Linux (CPU with SHA-NI or AVX-512)
+### Linux (CPU with AVX-512, SHA-NI, or AVX2)
 
-- x86-64 CPU with SHA-NI (Intel Goldmont+, AMD Zen+) or AVX-512 (Intel Skylake-X+, AMD Zen 4+)
+- x86-64 CPU with AVX-512 (Intel Skylake-X+, AMD Zen 4+), SHA-NI (Intel Goldmont+, AMD Zen+), or AVX2 (Intel Haswell+, AMD Excavator+)
 - OpenSSL development headers (`libssl-dev` / `openssl-devel`)
 - GCC 10+ with C++20 support
 
@@ -100,14 +100,14 @@ Sustained throughput: ~3.6 GH/s.
 | `c0ffeec0` | 8 | ~4.3B | ~0.2s |
 | `c0ffeec0ff` | 10 | ~1.1T | ~1 min |
 
-Sustained throughput: ~21 GH/s with AVX-512 (16-way), ~14 GH/s with SHA-NI (4-way). Backend auto-selected at runtime.
+Sustained throughput: ~21 GH/s with AVX-512 (16-way), ~14 GH/s with SHA-NI (4-way), AVX2 (8-way) as universal fallback. Backend auto-selected at runtime.
 
 ## How it works
 
 1. Read the current HEAD commit.
 2. Append invisible trailing whitespace to the commit message: padding spaces for SHA1 block alignment, followed by a 48-bit salt encoded as spaces (0) and tabs (1).
 3. Pre-compute SHA1 state for all blocks before the salt on the CPU.
-4. On macOS: dispatch millions of GPU threads via Metal compute shaders. On Linux: dispatch across all CPU cores using AVX-512 (16-way SIMD) or SHA-NI intrinsics (4-way), auto-selected at runtime.
+4. On macOS: dispatch millions of GPU threads via Metal compute shaders. On Linux: dispatch across all CPU cores using AVX-512 (16-way SIMD), SHA-NI (4-way), or AVX2 (8-way), auto-selected at runtime.
 5. Each thread/core tries a different salt, runs 80 SHA1 rounds, and checks the prefix.
 6. Write the winning commit object to the git store.
 7. Optionally update HEAD.
@@ -128,9 +128,10 @@ The salt and padding are completely invisible - they're trailing whitespace that
 
 #### Linux (CPU)
 
-- **Runtime backend selection** - auto-detects AVX-512 vs SHA-NI at startup via CPUID, picks the fastest available path.
+- **Runtime backend selection** - auto-detects AVX-512 > SHA-NI > AVX2 at startup via CPUID, picks the fastest available path.
 - **AVX-512 16-way SIMD** - processes 16 independent SHA1 hashes in parallel using 512-bit registers. Uses `vpternlogd` for 1-uop round functions, `vprold` for native rotate, and `vpermd` for SIMD salt LUT lookup.
 - **SHA-NI 4-way interleaved** - four independent SHA1 streams saturate the `sha1rnds4` pipeline (5-cycle latency, 1-cycle throughput). Deferred E computation skips finalization on non-matches.
+- **AVX2 8-way SIMD** - processes 8 independent SHA1 hashes using 256-bit registers with `vgatherdps` for salt LUT lookup. Universal x86-64 fallback for CPUs without AVX-512 or SHA-NI.
 - **Nibble LUT salt encoding** - builds SHA1 message words directly from the 48-bit salt via lookup table, skipping byte-level encoding and byte-swap shuffles.
 - **Incremental salt update** - only recomputes the 4 low words each iteration; the 8 high words are reused across 65536 consecutive salts.
 - **Autonomous workers** - each thread owns a contiguous salt range with no synchronization barriers. Scales from 4 cores to 192+.
