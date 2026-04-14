@@ -100,11 +100,23 @@ int main() {
     // Medium prefix
     check_cpu("7-nibble prefix (odd)", "deadbee", "seven nibbles\n");
 
-    // Different commit shapes with 6-nibble prefix
-    check_cpu("long message", "c0ffee", std::string(500, 'X') + "\n");
-    check_cpu("empty message", "c0ffee", "\n");
-    check_cpu("multi-line", "c0ffee",
+    // 8-nibble prefix (~2s on fast hardware)
+    check_cpu("8-nibble prefix", "c0ffeec0", "eight nibbles\n");
+
+    // Different commit shapes — test each with varying prefix lengths
+    // to exercise both even/odd prefix paths across commit types
+    check_cpu("long message 2-nib", "ab", std::string(500, 'X') + "\n");
+    check_cpu("long message 5-nib", "c0ffe", std::string(500, 'X') + "\n");
+    check_cpu("long message 6-nib", "c0ffee", std::string(500, 'X') + "\n");
+    check_cpu("long message 7-nib", "deadbee", std::string(500, 'Y') + "\n");
+    check_cpu("empty message 3-nib", "bad", "\n");
+    check_cpu("empty message 6-nib", "c0ffee", "\n");
+    check_cpu("multi-line 4-nib", "f00d",
         "feat: something\n\nLong description here.\n\n- item 1\n- item 2\n");
+    check_cpu("multi-line 7-nib", "deadbee",
+        "feat: another\n\nMore description.\n\n- item A\n- item B\n");
+    check_cpu("multi-line 8-nib", "c0ffeec0",
+        "feat: eight\n\nEight nibble multi-line.\n");
 
     // Re-run: solve on an already-salted commit
     {

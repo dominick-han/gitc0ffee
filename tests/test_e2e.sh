@@ -52,14 +52,14 @@ echo "TAP version 13"
 # --- Basic prefix lengths ---
 
 setup_repo
-git commit -q --no-verify -m "test short prefix"
+git commit -q --no-verify -m "test 2 nibble"
 HASH=$("$BIN" aa 2>/dev/null)
 check "2-nibble prefix" "aa" "$HASH"
 
 setup_repo
-git commit -q --no-verify -m "test odd prefix"
+git commit -q --no-verify -m "test 3 nibble"
 HASH=$("$BIN" bad 2>/dev/null)
-check "3-nibble odd prefix" "bad" "$HASH"
+check "3-nibble prefix (odd)" "bad" "$HASH"
 
 setup_repo
 git commit -q --no-verify -m "test 4 nibble"
@@ -67,9 +67,19 @@ HASH=$("$BIN" f00d 2>/dev/null)
 check "4-nibble prefix" "f00d" "$HASH"
 
 setup_repo
+git commit -q --no-verify -m "test 5 nibble"
+HASH=$("$BIN" c0ffe 2>/dev/null)
+check "5-nibble prefix (odd)" "c0ffe" "$HASH"
+
+setup_repo
 git commit -q --no-verify -m "test 6 nibble"
 HASH=$("$BIN" c0ffee 2>/dev/null)
 check "6-nibble prefix" "c0ffee" "$HASH"
+
+setup_repo
+git commit -q --no-verify -m "test 7 nibble"
+HASH=$("$BIN" deadbee 2>/dev/null)
+check "7-nibble prefix (odd)" "deadbee" "$HASH"
 
 # --- 8-nibble prefix (the real test, ~2s) ---
 
@@ -112,7 +122,7 @@ fi
 setup_repo
 git commit -q --no-verify -m "$(python3 -c "print('A' * 2000)")"
 HASH=$("$BIN" c0ffee 2>/dev/null)
-check "long commit message" "c0ffee" "$HASH"
+check "long commit message 6-nib" "c0ffee" "$HASH"
 
 # --- Multi-line commit message ---
 
@@ -125,7 +135,33 @@ This is a detailed description of the feature.
 - Point 2
 - Point 3"
 HASH=$("$BIN" c0ffee 2>/dev/null)
-check "multi-line message" "c0ffee" "$HASH"
+check "multi-line message 6-nib" "c0ffee" "$HASH"
+
+# --- Shapes at different prefix lengths ---
+
+setup_repo
+git commit -q --no-verify -m "$(python3 -c "print('B' * 2000)")"
+HASH=$("$BIN" bad 2>/dev/null)
+check "long message 3-nib" "bad" "$HASH"
+
+setup_repo
+git commit -q --no-verify -m "$(python3 -c "print('C' * 2000)")"
+HASH=$("$BIN" deadbee 2>/dev/null)
+check "long message 7-nib" "deadbee" "$HASH"
+
+setup_repo
+git commit -q --no-verify -m "feat: odd prefix
+
+Multi-line with 5-nibble prefix test."
+HASH=$("$BIN" c0ffe 2>/dev/null)
+check "multi-line 5-nib" "c0ffe" "$HASH"
+
+setup_repo
+git commit -q --no-verify -m "feat: eight nibble
+
+Multi-line with 8-nibble prefix test."
+HASH=$("$BIN" deadbeef 2>/dev/null)
+check "multi-line 8-nib" "deadbeef" "$HASH"
 
 # --- Commit message stays clean (no visible artifacts) ---
 
