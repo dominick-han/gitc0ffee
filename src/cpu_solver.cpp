@@ -146,6 +146,10 @@ static CPUParams precompute(const ObjectTemplate& tpl, const std::string& prefix
     return p;
 }
 
+static inline uint32_t rotl32(uint32_t x, int n) {
+    return (x << n) | (x >> (32 - n));
+}
+
 struct alignas(64) WorkerResult {
     uint64_t salt;
     uint32_t hash[5];
@@ -208,10 +212,9 @@ static void avx512_worker(const CPUParams& p, uint64_t salt_start, uint64_t salt
     const __m512i VK2 = _mm512_set1_epi32((int)SHA1_K[2]);
     const __m512i VK3 = _mm512_set1_epi32((int)SHA1_K[3]);
 
-    const __m512i W12_C = _mm512_set1_epi32((int)p.msg_words[12]);
-    const __m512i W13_C = _mm512_set1_epi32((int)p.msg_words[13]);
-    const __m512i W14_C = _mm512_set1_epi32((int)p.msg_words[14]);
-    const __m512i W15_C = _mm512_set1_epi32((int)p.msg_words[15]);
+    // Constant tail words
+    const uint32_t cw12 = p.msg_words[12], cw13 = p.msg_words[13],
+                   cw14 = p.msg_words[14], cw15 = p.msg_words[15];
 
     const __m512i vmask0 = _mm512_set1_epi32((int)p.mask0);
     const __m512i vtarget0 = _mm512_set1_epi32((int)p.target0);
@@ -229,16 +232,46 @@ static void avx512_worker(const CPUParams& p, uint64_t salt_start, uint64_t salt
 
     uint64_t salt = salt_start;
 
+    // Scalar SHA1 round helper for precomputing uniform rounds
+    auto scalar_round = [](uint32_t a, uint32_t e,
+                           uint32_t f, uint32_t w, uint32_t k) -> uint32_t {
+        return ((a << 5) | (a >> 27)) + f + e + k + w;
+    };
+    auto scalar_ch  = [](uint32_t b, uint32_t c, uint32_t d) { return (b & c) | ((~b) & d); };
+
     while (salt < salt_end) {
         // Outer loop: words 0-7 uniform (high nibbles identical for 65536 salts)
-        __m512i W0_base = _mm512_set1_epi32((int)salt_lut[(salt >> 44) & 0xF]);
-        __m512i W1_base = _mm512_set1_epi32((int)salt_lut[(salt >> 40) & 0xF]);
-        __m512i W2_base = _mm512_set1_epi32((int)salt_lut[(salt >> 36) & 0xF]);
-        __m512i W3_base = _mm512_set1_epi32((int)salt_lut[(salt >> 32) & 0xF]);
-        __m512i W4_base = _mm512_set1_epi32((int)salt_lut[(salt >> 28) & 0xF]);
-        __m512i W5_base = _mm512_set1_epi32((int)salt_lut[(salt >> 24) & 0xF]);
-        __m512i W6_base = _mm512_set1_epi32((int)salt_lut[(salt >> 20) & 0xF]);
-        __m512i W7_base = _mm512_set1_epi32((int)salt_lut[(salt >> 16) & 0xF]);
+        // Since W[0]-W[7] are broadcast (identical across all 16 lanes),
+        // rounds 0-7 produce identical state in every lane. Precompute
+        // as scalar and broadcast into the inner loop — saves 8 SIMD rounds.
+        uint32_t sw[8];
+        sw[0] = salt_lut[(salt >> 44) & 0xF];
+        sw[1] = salt_lut[(salt >> 40) & 0xF];
+        sw[2] = salt_lut[(salt >> 36) & 0xF];
+        sw[3] = salt_lut[(salt >> 32) & 0xF];
+        sw[4] = salt_lut[(salt >> 28) & 0xF];
+        sw[5] = salt_lut[(salt >> 24) & 0xF];
+        sw[6] = salt_lut[(salt >> 20) & 0xF];
+        sw[7] = salt_lut[(salt >> 16) & 0xF];
+
+        // Precompute rounds 0-7 as scalar (Ch function, K0)
+        uint32_t sa = p.pre_state[0], sb = p.pre_state[1], sc = p.pre_state[2],
+                 sd = p.pre_state[3], se = p.pre_state[4];
+        for (int i = 0; i < 8; ++i) {
+            uint32_t f = scalar_ch(sb, sc, sd);
+            uint32_t t = scalar_round(sa, se, f, sw[i], SHA1_K[0]);
+            se = sd; sd = sc; sc = (sb << 30) | (sb >> 2); sb = sa; sa = t;
+        }
+
+        // Still need W[0]-W[7] as SIMD for message schedule expansion in rounds 16+
+        __m512i W0_base = _mm512_set1_epi32((int)sw[0]);
+        __m512i W1_base = _mm512_set1_epi32((int)sw[1]);
+        __m512i W2_base = _mm512_set1_epi32((int)sw[2]);
+        __m512i W3_base = _mm512_set1_epi32((int)sw[3]);
+        __m512i W4_base = _mm512_set1_epi32((int)sw[4]);
+        __m512i W5_base = _mm512_set1_epi32((int)sw[5]);
+        __m512i W6_base = _mm512_set1_epi32((int)sw[6]);
+        __m512i W7_base = _mm512_set1_epi32((int)sw[7]);
 
         uint64_t inner_end = (salt | 0xFFFF) + 1;
         if (inner_end > salt_end) inner_end = salt_end;
@@ -246,58 +279,99 @@ static void avx512_worker(const CPUParams& p, uint64_t salt_start, uint64_t salt
         if (global_found.load(std::memory_order_relaxed)) return;
 
         for (uint64_t s = salt; s + 16 <= inner_end; s += 16) {
-            // SIMD salt LUT lookup
+            // W[8]-W[10] are uniform across all 16 lanes (only bits 0-3 differ,
+            // which only affects W[11]). Precompute rounds 8-10 as scalar.
+            uint32_t sw8  = salt_lut[(s >> 12) & 0xF];
+            uint32_t sw9  = salt_lut[(s >> 8) & 0xF];
+            uint32_t sw10 = salt_lut[(s >> 4) & 0xF];
+
+            // Precompute rounds 8-10 as scalar
+            uint32_t ma = sa, mb = sb, mc = sc, md = sd, me = se;
+            {
+                uint32_t f8 = scalar_ch(mb, mc, md);
+                uint32_t t8 = scalar_round(ma, me, f8, sw8, SHA1_K[0]);
+                me = md; md = mc; mc = (mb << 30) | (mb >> 2); mb = ma; ma = t8;
+
+                uint32_t f9 = scalar_ch(mb, mc, md);
+                uint32_t t9 = scalar_round(ma, me, f9, sw9, SHA1_K[0]);
+                me = md; md = mc; mc = (mb << 30) | (mb >> 2); mb = ma; ma = t9;
+
+                uint32_t f10 = scalar_ch(mb, mc, md);
+                uint32_t t10 = scalar_round(ma, me, f10, sw10, SHA1_K[0]);
+                me = md; md = mc; mc = (mb << 30) | (mb >> 2); mb = ma; ma = t10;
+            }
+
+            // W[16]-W[18] are also uniform: they depend only on W[0]-W[10],W[12]-W[15]
+            // (W[11] first appears in W[19]). Precompute as scalar to skip SIMD expansion.
+            // W[i] = rotl(W[i-3]^W[i-8]^W[i-14]^W[i-16], 1)
+            uint32_t sw16 = rotl32(p.msg_words[13] ^ sw8  ^ sw[2] ^ sw[0], 1);
+            uint32_t sw17 = rotl32(p.msg_words[14] ^ sw9  ^ sw[3] ^ sw[1], 1);
+            uint32_t sw18 = rotl32(p.msg_words[15] ^ sw10 ^ sw[4] ^ sw[2], 1);
+            // W[20],W[21],W[23],W[24] are also uniform (don't depend on W[11])
+            uint32_t sw20 = rotl32(sw17 ^ p.msg_words[12] ^ sw[6] ^ sw[4], 1);
+            uint32_t sw21 = rotl32(sw18 ^ p.msg_words[13] ^ sw[7] ^ sw[5], 1);
+            uint32_t sw23 = rotl32(sw20 ^ p.msg_words[15] ^ sw9  ^ sw[7], 1);
+            uint32_t sw24 = rotl32(sw21 ^ sw16             ^ sw10 ^ sw8,  1);
+
+            // SIMD salt LUT lookup — only W[11] varies per lane
             __m512i sv = _mm512_add_epi32(_mm512_set1_epi32((int)s), LANE_IDS);
-            __m512i W8_v  = _mm512_permutexvar_epi32(_mm512_and_si512(_mm512_srli_epi32(sv, 12), NIBBLE_MASK), SALT_LUT);
-            __m512i W9_v  = _mm512_permutexvar_epi32(_mm512_and_si512(_mm512_srli_epi32(sv, 8), NIBBLE_MASK), SALT_LUT);
-            __m512i W10_v = _mm512_permutexvar_epi32(_mm512_and_si512(_mm512_srli_epi32(sv, 4), NIBBLE_MASK), SALT_LUT);
             __m512i W11_v = _mm512_permutexvar_epi32(_mm512_and_si512(sv, NIBBLE_MASK), SALT_LUT);
 
-            // W array on stack — compiler keeps hot values in regs, spills cold ones
+            // W array on stack — needed for message schedule expansion in rounds 16+
             alignas(64) __m512i W[16];
             W[0]=W0_base; W[1]=W1_base; W[2]=W2_base; W[3]=W3_base;
             W[4]=W4_base; W[5]=W5_base; W[6]=W6_base; W[7]=W7_base;
-            W[8]=W8_v; W[9]=W9_v; W[10]=W10_v; W[11]=W11_v;
-            W[12]=W12_C; W[13]=W13_C; W[14]=W14_C; W[15]=W15_C;
+            W[8]=_mm512_set1_epi32((int)sw8);
+            W[9]=_mm512_set1_epi32((int)sw9);
+            W[10]=_mm512_set1_epi32((int)sw10);
+            W[11]=W11_v;
+            W[12]=_mm512_set1_epi32((int)cw12);
+            W[13]=_mm512_set1_epi32((int)cw13);
+            W[14]=_mm512_set1_epi32((int)cw14);
+            W[15]=_mm512_set1_epi32((int)cw15);
 
-            __m512i a = INIT_A, b = INIT_B, c = INIT_C, d = INIT_D, e = INIT_E;
+            // Start from precomputed state after round 10
+            __m512i a = _mm512_set1_epi32((int)ma);
+            __m512i b = _mm512_set1_epi32((int)mb);
+            __m512i c = _mm512_set1_epi32((int)mc);
+            __m512i d = _mm512_set1_epi32((int)md);
+            __m512i e = _mm512_set1_epi32((int)me);
             __m512i f;
 
-            // All 80 rounds use AVX512_ROUND_W which reads W[i] from the stack
-            // array and adds K inline. This keeps register pressure minimal:
-            // only a,b,c,d,e + f + 1 kw temp = 7 zmm for rounds, leaving 25
-            // for the compiler to manage W[], K constants, and loop vars.
-
-            // Rounds 0-15: Ch
-            f=CH(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,0,VK0);
-            f=CH(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,1,VK0);
-            f=CH(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,2,VK0);
-            f=CH(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,3,VK0);
-            f=CH(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,4,VK0);
-            f=CH(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,5,VK0);
-            f=CH(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,6,VK0);
-            f=CH(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,7,VK0);
-            f=CH(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,8,VK0);
-            f=CH(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,9,VK0);
-            f=CH(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,10,VK0);
+            // Round 11: first SIMD round (W[11] varies per lane)
             f=CH(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,11,VK0);
             f=CH(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,12,VK0);
             f=CH(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,13,VK0);
             f=CH(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,14,VK0);
             f=CH(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,15,VK0);
 
-            // Rounds 16-19: Ch
-            AVX512_EROUND(W,16,a,b,c,d,e,CH,VK0);
-            AVX512_EROUND(W,17,a,b,c,d,e,CH,VK0);
-            AVX512_EROUND(W,18,a,b,c,d,e,CH,VK0);
+            // Rounds 16-18: use precomputed uniform W values (skip SIMD expansion)
+            W[0] = _mm512_set1_epi32((int)sw16);
+            f=CH(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,0,VK0);
+            W[1] = _mm512_set1_epi32((int)sw17);
+            f=CH(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,1,VK0);
+            W[2] = _mm512_set1_epi32((int)sw18);
+            f=CH(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,2,VK0);
+
+            // Round 19: W[19] varies per lane (depends on W[11]), must use SIMD expansion
             AVX512_EROUND(W,19,a,b,c,d,e,CH,VK0);
 
-            // Rounds 20-39: Parity
-            AVX512_EROUND(W,20,a,b,c,d,e,PA,VK1);
-            AVX512_EROUND(W,21,a,b,c,d,e,PA,VK1);
+            // Rounds 20-21: inject precomputed uniform W (skip expansion)
+            W[4] = _mm512_set1_epi32((int)sw20);
+            f=PA(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,4,VK1);
+            W[5] = _mm512_set1_epi32((int)sw21);
+            f=PA(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,5,VK1);
+
+            // Round 22: W[22] varies (depends on W[19])
             AVX512_EROUND(W,22,a,b,c,d,e,PA,VK1);
-            AVX512_EROUND(W,23,a,b,c,d,e,PA,VK1);
-            AVX512_EROUND(W,24,a,b,c,d,e,PA,VK1);
+
+            // Rounds 23-24: inject precomputed uniform W
+            W[7] = _mm512_set1_epi32((int)sw23);
+            f=PA(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,7,VK1);
+            W[8] = _mm512_set1_epi32((int)sw24);
+            f=PA(b,c,d); AVX512_ROUND_W(a,b,c,d,e,f,W,8,VK1);
+
+            // Rounds 25+: all W values have varying dependencies, full expansion
             AVX512_EROUND(W,25,a,b,c,d,e,PA,VK1);
             AVX512_EROUND(W,26,a,b,c,d,e,PA,VK1);
             AVX512_EROUND(W,27,a,b,c,d,e,PA,VK1);
