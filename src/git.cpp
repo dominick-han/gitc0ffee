@@ -3,45 +3,60 @@
 #include <array>
 #include <cstdio>
 #include <fcntl.h>
-#include <memory>
 #include <stdexcept>
 #include <sys/wait.h>
 #include <unistd.h>
 
 namespace git {
 
-// Run a git command, return stdout with trailing newlines stripped.
-static std::string run(const std::string& args) {
-    std::string cmd = args + " 2>/dev/null";
-    std::unique_ptr<FILE, decltype(&pclose)> p(popen(cmd.c_str(), "r"), pclose);
-    if (!p) throw std::runtime_error("popen failed");
-    std::string out;
+// Fork+exec a git command, capture stdout into a byte vector.
+// Avoids popen/shell overhead entirely.
+static std::vector<uint8_t> exec_git(const std::vector<const char*>& argv) {
+    int pipefd[2];
+    if (pipe(pipefd) < 0) throw std::runtime_error("pipe failed");
+
+    pid_t pid = fork();
+    if (pid < 0) { close(pipefd[0]); close(pipefd[1]); throw std::runtime_error("fork failed"); }
+
+    if (pid == 0) {
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[1]);
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
+        execvp("git", const_cast<char* const*>(argv.data()));
+        _exit(1);
+    }
+
+    close(pipefd[1]);
+    std::vector<uint8_t> out;
     std::array<char, 4096> buf;
-    while (auto n = fread(buf.data(), 1, buf.size(), p.get()))
-        out.append(buf.data(), n);
-    while (!out.empty() && out.back() == '\n') out.pop_back();
+    for (;;) {
+        auto n = ::read(pipefd[0], buf.data(), buf.size());
+        if (n <= 0) break;
+        out.insert(out.end(), buf.data(), buf.data() + n);
+    }
+    close(pipefd[0]);
+    waitpid(pid, nullptr, 0);
     return out;
 }
 
 HexDigest get_head_digest() {
-    auto out = run("git rev-parse HEAD");
-    if (out.size() != 40) throw std::runtime_error("bad HEAD: " + out);
+    auto out = exec_git({"git", "rev-parse", "HEAD", nullptr});
+    // Strip trailing newline
+    while (!out.empty() && out.back() == '\n') out.pop_back();
+    if (out.size() != 40) throw std::runtime_error("bad HEAD");
     HexDigest d;
     std::copy(out.begin(), out.end(), d.begin());
     return d;
 }
 
 std::vector<uint8_t> get_commit_contents(const HexDigest& digest) {
-    std::string cmd = "git cat-file -p ";
-    cmd.append(digest.data(), 40);
-    cmd += " 2>/dev/null";
-    std::unique_ptr<FILE, decltype(&pclose)> p(popen(cmd.c_str(), "r"), pclose);
-    if (!p) throw std::runtime_error("popen failed");
-    std::vector<uint8_t> out;
-    std::array<char, 4096> buf;
-    while (auto n = fread(buf.data(), 1, buf.size(), p.get()))
-        out.insert(out.end(), buf.data(), buf.data() + n);
-    return out;
+    // Use a stack buffer for the digest string to avoid allocation
+    char hash[41];
+    std::copy(digest.begin(), digest.end(), hash);
+    hash[40] = '\0';
+    return exec_git({"git", "cat-file", "-p", hash, nullptr});
 }
 
 HexDigest write_object(const std::string& type, const std::vector<uint8_t>& contents) {
@@ -91,7 +106,7 @@ HexDigest write_object(const std::string& type, const std::vector<uint8_t>& cont
 }
 
 void update_reference(const std::string& ref, const std::string& hash) {
-    run("git update-ref '" + ref + "' '" + hash + "'");
+    exec_git({"git", "update-ref", ref.c_str(), hash.c_str(), nullptr});
 }
 
 }  // namespace git

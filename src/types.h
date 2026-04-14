@@ -31,10 +31,23 @@ struct ObjectTemplate {
     int salt_offset = 0;
 
     void set_salt(uint64_t salt) {
+        // Nibble LUT: each 4-bit value maps to 4 bytes of space/tab encoding.
+        // Bit 0 in each nibble position: space (0x20) = 0, tab (0x09) = 1.
+        // XOR mask against 0x20202020 (all spaces).
+        static constexpr uint32_t lut[16] = {
+            0x20202020u, 0x20202009u, 0x20200920u, 0x20200909u,
+            0x20092020u, 0x20092009u, 0x20090920u, 0x20090909u,
+            0x09202020u, 0x09202009u, 0x09200920u, 0x09200909u,
+            0x09092020u, 0x09092009u, 0x09090920u, 0x09090909u,
+        };
         uint8_t* dst = bytes.data() + salt_offset;
-        for (int i = 47; i >= 0; --i) {
-            dst[i] = (salt & 1) ? '\t' : ' ';
-            salt >>= 1;
+        // 48 bits = 12 nibbles = 12 words of 4 bytes each
+        for (int i = 0; i < 12; ++i) {
+            uint32_t w = lut[(salt >> ((11 - i) * 4)) & 0xF];
+            dst[i * 4]     = static_cast<uint8_t>(w >> 24);
+            dst[i * 4 + 1] = static_cast<uint8_t>(w >> 16);
+            dst[i * 4 + 2] = static_cast<uint8_t>(w >> 8);
+            dst[i * 4 + 3] = static_cast<uint8_t>(w);
         }
     }
 
