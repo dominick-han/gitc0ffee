@@ -14,6 +14,7 @@ static void usage(const char* prog) {
               << "Usage: " << prog << " [OPTIONS] [HEX]\n\n"
               << "  HEX             hex prefix to match (default: c0ffee)\n"
               << "  -w, --write     write object and update HEAD\n"
+              << "  -b, --backend   force backend (avx512, sha-ni, avx2, metal)\n"
               << "  -q, --quiet     suppress progress output\n"
               << "  -V, --version   print version\n"
               << "  -h, --help      show this help\n";
@@ -21,21 +22,24 @@ static void usage(const char* prog) {
 
 int main(int argc, char** argv) {
     std::string prefix_hex = "c0ffee";
+    std::string backend;
     bool update_ref = false;
     bool quiet = false;
 
     static const struct option long_opts[] = {
-        {"write",   no_argument, nullptr, 'w'},
-        {"quiet",   no_argument, nullptr, 'q'},
-        {"version", no_argument, nullptr, 'V'},
-        {"help",    no_argument, nullptr, 'h'},
+        {"write",   no_argument,       nullptr, 'w'},
+        {"backend", required_argument, nullptr, 'b'},
+        {"quiet",   no_argument,       nullptr, 'q'},
+        {"version", no_argument,       nullptr, 'V'},
+        {"help",    no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
     };
 
     int c;
-    while ((c = getopt_long(argc, argv, "wqVh", long_opts, nullptr)) != -1) {
+    while ((c = getopt_long(argc, argv, "wb:qVh", long_opts, nullptr)) != -1) {
         switch (c) {
             case 'w': update_ref = true; break;
+            case 'b': backend = optarg; break;
             case 'q': quiet = true; break;
             case 'V': std::cerr << "gitc0ffee " << VERSION << "\n"; return 0;
             case 'h': usage(argv[0]); return 0;
@@ -65,7 +69,7 @@ int main(int argc, char** argv) {
     std::cerr << "Object Size    " << tpl.bytes.size() << " bytes\n"
               << "Salt Offset    " << tpl.salt_offset << "\n\n";
 
-    auto result = solve(tpl, prefix_hex);
+    auto result = solve(tpl, prefix_hex, backend);
     if (!result) { std::cout << "No Solution Found\n"; return 1; }
 
     auto hash = hex_digest_to_string(result->hash);

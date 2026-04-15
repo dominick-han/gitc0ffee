@@ -59,8 +59,15 @@ static GPUParams precompute(const ObjectTemplate& tpl, const std::string& prefix
 }
 
 std::optional<SolveResult> solve(const ObjectTemplate& tpl,
-                                     const std::string& prefix_hex) {
+                                     const std::string& prefix_hex,
+                                     const std::string& backend_override) {
     @autoreleasepool {
+        if (!backend_override.empty() && backend_override != "metal") {
+            fprintf(stderr, "Error: backend '%s' not available (macOS Metal build)\n",
+                    backend_override.c_str());
+            return std::nullopt;
+        }
+
         id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
         if (!dev) { fprintf(stderr, "Error: No Metal device\n"); return std::nullopt; }
 
