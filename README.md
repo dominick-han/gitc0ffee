@@ -100,7 +100,7 @@ Sustained throughput: ~3.6 GH/s.
 | `c0ffeec0` | 8 | ~4.3B | ~0.2s |
 | `c0ffeec0ff` | 10 | ~1.1T | ~1 min |
 
-Sustained throughput: ~21 GH/s with AVX-512 (16-way), ~14 GH/s with SHA-NI (4-way), AVX2 (8-way) as universal fallback. Backend auto-selected at runtime.
+Sustained throughput: ~22 GH/s with AVX-512 (16-way), ~14 GH/s with SHA-NI (4-way), AVX2 (8-way) as universal fallback. Backend auto-selected at runtime.
 
 ## How it works
 
