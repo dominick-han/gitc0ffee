@@ -1,291 +1,198 @@
-// cpu_solver_avx2.cpp - AVX2 backend: 8-way parallel SHA1
+// avx2.cpp - AVX2 backend: 8-way parallel SHA-1 brute force
+//
+// Each SIMD batch hashes 8 salts at once (one per ymm lane). The salt's
+// 12 nibbles map one-to-one onto W[0..11] of the SHA-1 message schedule.
+// When enumerating salts in order, high nibbles stay fixed for long runs,
+// so we can precompute the SHA-1 rounds that only depend on those high
+// nibbles once and reuse the partial state across many hashes:
+//
+//   Level 3 (per 65536 salts)  W[0..7]  constant -> precompute rounds 0-7
+//   Level 2 (per  4096 salts)  + W[8]   constant -> precompute round  8
+//   Level 1 (per   256 salts)  + W[9]   constant -> precompute round  9
+//   Level 0 (per     8 salts)  + W[10]  constant -> precompute round 10
+//                                W[11]  differs per lane -> round 11 collapses to
+//                                                           a single SIMD add, then
+//                                                           rounds 12+ run SIMD
 
 #include "cpu/common.h"
-#include <immintrin.h>
+#include <algorithm>
 #include <atomic>
+#include <immintrin.h>
 
-#ifdef __x86_64__
+#pragma GCC target("avx2")
 
-static inline __m256i avx2_rotl(__m256i x, int n) {
-    return _mm256_or_si256(_mm256_slli_epi32(x, n), _mm256_srli_epi32(x, 32 - n));
-}
-static inline __m256i avx2_ch(__m256i b, __m256i c, __m256i d) {
-    return _mm256_xor_si256(_mm256_and_si256(b, _mm256_xor_si256(c, d)), d);
-}
-static inline __m256i avx2_parity(__m256i b, __m256i c, __m256i d) {
-    return _mm256_xor_si256(_mm256_xor_si256(b, c), d);
-}
-static inline __m256i avx2_maj(__m256i b, __m256i c, __m256i d) {
-    return _mm256_or_si256(_mm256_and_si256(b, c),
-                           _mm256_and_si256(_mm256_or_si256(b, c), d));
+// SHA-1 primitives (SIMD).
+static inline __m256i rol   (__m256i x, int n)                 { return _mm256_or_si256(_mm256_slli_epi32(x, n), _mm256_srli_epi32(x, 32 - n)); }
+static inline __m256i f_ch  (__m256i b, __m256i c, __m256i d)  { return _mm256_xor_si256(_mm256_and_si256(b, _mm256_xor_si256(c, d)), d); }
+static inline __m256i f_par (__m256i b, __m256i c, __m256i d)  { return _mm256_xor_si256(_mm256_xor_si256(b, c), d); }
+static inline __m256i f_maj (__m256i b, __m256i c, __m256i d)  { return _mm256_or_si256(_mm256_and_si256(b, c), _mm256_and_si256(_mm256_or_si256(b, c), d)); }
+
+// W[i] = rol(W[i-3] ^ W[i-8] ^ W[i-14] ^ W[i-16], 1)
+static inline __m256i expand(__m256i w3, __m256i w8, __m256i w14, __m256i w16) {
+    return rol(_mm256_xor_si256(_mm256_xor_si256(w3, w8), _mm256_xor_si256(w14, w16)), 1);
 }
 
-#define AVX2_ROUND_W(a, b, c, d, e, f, Warr, idx, Kv) do { \
-    __m256i _kw = _mm256_add_epi32(Kv, Warr[idx]); \
-    __m256i _t = _mm256_add_epi32(_mm256_add_epi32(avx2_rotl(a, 5), f), \
-                                   _mm256_add_epi32(e, _kw)); \
-    e = d; d = c; c = avx2_rotl(b, 30); b = a; a = _t; \
-} while(0)
+// One SHA-1 round: t = rol(a,5) + f + e + k + w; (a,b,c,d,e) <- (t, a, rol(b,30), c, d)
+static inline void sha1_round(__m256i& a, __m256i& b, __m256i& c, __m256i& d, __m256i& e, __m256i f, __m256i w, __m256i k) {
+    __m256i t = _mm256_add_epi32(_mm256_add_epi32(rol(a, 5), f), _mm256_add_epi32(e, _mm256_add_epi32(k, w)));
+    e = d; d = c; c = rol(b, 30); b = a; a = t;
+}
 
-#define AVX2_EXPAND(W, i) do { \
-    __m256i _x = _mm256_xor_si256(_mm256_xor_si256(W[(i-3)&15], W[(i-8)&15]), W[(i-14)&15]); \
-    W[(i)&15] = avx2_rotl(_mm256_xor_si256(_x, W[(i-16)&15]), 1); \
-} while(0)
+// Scalar round, used to precompute the SHA-1 prefix where every lane agrees.
+static inline void scalar_round(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d, uint32_t& e, uint32_t w, uint32_t k) {
+    uint32_t f = (b & c) | (~b & d);
+    uint32_t t = rotl32(a, 5) + f + e + k + w;
+    e = d; d = c; c = rotl32(b, 30); b = a; a = t;
+}
 
-#define AVX2_EROUND(W, i, a, b, c, d, e, fn, Kv) do { \
-    AVX2_EXPAND(W, i); \
-    __m256i _f = fn(b,c,d); \
-    AVX2_ROUND_W(a, b, c, d, e, _f, W, (i)&15, Kv); \
-} while(0)
-
-__attribute__((target("avx2")))
-void avx2_worker(const CPUParams& p, uint64_t salt_start, uint64_t salt_end,
-                         std::atomic<bool>& global_found, WorkerResult& result) {
-    result.found = false;
+void avx2_worker(const CPUParams& p, uint64_t salt_start, uint64_t salt_end, std::atomic<bool>& global_found, WorkerResult& result) {
+    result.found  = false;
     result.hashes = 0;
 
-    const __m256i INIT_A = _mm256_set1_epi32((int)p.pre_state[0]);
-    const __m256i INIT_B = _mm256_set1_epi32((int)p.pre_state[1]);
-    const __m256i INIT_C = _mm256_set1_epi32((int)p.pre_state[2]);
-    const __m256i INIT_D = _mm256_set1_epi32((int)p.pre_state[3]);
-    const __m256i INIT_E = _mm256_set1_epi32((int)p.pre_state[4]);
-
-    const __m256i VK0 = _mm256_set1_epi32((int)SHA1_K[0]);
-    const __m256i VK1 = _mm256_set1_epi32((int)SHA1_K[1]);
-    const __m256i VK2 = _mm256_set1_epi32((int)SHA1_K[2]);
-    const __m256i VK3 = _mm256_set1_epi32((int)SHA1_K[3]);
-
-    const uint32_t cw12 = p.msg_words[12], cw13 = p.msg_words[13],
-                   cw14 = p.msg_words[14], cw15 = p.msg_words[15];
-
-    const __m256i vmask0 = _mm256_set1_epi32((int)p.mask0);
-    const __m256i vtarget0 = _mm256_set1_epi32((int)p.target0);
-    const __m256i vmask1 = _mm256_set1_epi32((int)p.mask1);
-    const __m256i vtarget1 = _mm256_set1_epi32((int)p.target1);
-    const uint32_t pn = p.prefix_len;
-
-    // AVX2 salt LUT: use vgatherdps with index vector
-    const __m256i LANE_IDS = _mm256_setr_epi32(0,1,2,3,4,5,6,7);
-    const __m256i NIBBLE_MASK = _mm256_set1_epi32(0xF);
-
-    auto scalar_ch  = [](uint32_t b, uint32_t c, uint32_t d) { return (b & c) | ((~b) & d); };
-    auto scalar_round = [](uint32_t a, uint32_t e,
-                           uint32_t f, uint32_t w, uint32_t k) -> uint32_t {
-        return ((a << 5) | (a >> 27)) + f + e + k + w;
+    const __m256i VK[4] = {
+        _mm256_set1_epi32((int)SHA1_K[0]), _mm256_set1_epi32((int)SHA1_K[1]),
+        _mm256_set1_epi32((int)SHA1_K[2]), _mm256_set1_epi32((int)SHA1_K[3]),
     };
 
-    uint64_t salt = salt_start;
+    // W[11] differs per lane only in its low nibble. Inner-loop salts are
+    // 8-aligned, so lane i's nibble is exactly i — W[11] is just the first
+    // 8 entries of the salt LUT loaded verbatim.
+    const __m256i W11 = _mm256_loadu_si256((const __m256i*)salt_lut);
 
-    while (salt < salt_end) {
-        uint32_t sw[8];
-        sw[0] = salt_lut[(salt >> 44) & 0xF];
-        sw[1] = salt_lut[(salt >> 40) & 0xF];
-        sw[2] = salt_lut[(salt >> 36) & 0xF];
-        sw[3] = salt_lut[(salt >> 32) & 0xF];
-        sw[4] = salt_lut[(salt >> 28) & 0xF];
-        sw[5] = salt_lut[(salt >> 24) & 0xF];
-        sw[6] = salt_lut[(salt >> 20) & 0xF];
-        sw[7] = salt_lut[(salt >> 16) & 0xF];
-
-        uint32_t sa = p.pre_state[0], sb = p.pre_state[1], sc = p.pre_state[2],
-                 sd = p.pre_state[3], se = p.pre_state[4];
+    // Level 3: per 65536 salts. W[0..7] constant, run rounds 0-7 as scalar.
+    for (uint64_t salt = salt_start; salt < salt_end; ) {
+        uint32_t sw[11];
+        uint32_t l3a = p.pre_state[0], l3b = p.pre_state[1], l3c = p.pre_state[2],
+                 l3d = p.pre_state[3], l3e = p.pre_state[4];
         for (int i = 0; i < 8; ++i) {
-            uint32_t f = scalar_ch(sb, sc, sd);
-            uint32_t t = scalar_round(sa, se, f, sw[i], SHA1_K[0]);
-            se = sd; sd = sc; sc = (sb << 30) | (sb >> 2); sb = sa; sa = t;
+            sw[i] = salt_lut[(salt >> (44 - 4*i)) & 0xF];
+            scalar_round(l3a, l3b, l3c, l3d, l3e, sw[i], SHA1_K[0]);
         }
 
-        __m256i W0_base = _mm256_set1_epi32((int)sw[0]);
-        __m256i W1_base = _mm256_set1_epi32((int)sw[1]);
-        __m256i W2_base = _mm256_set1_epi32((int)sw[2]);
-        __m256i W3_base = _mm256_set1_epi32((int)sw[3]);
-        __m256i W4_base = _mm256_set1_epi32((int)sw[4]);
-        __m256i W5_base = _mm256_set1_epi32((int)sw[5]);
-        __m256i W6_base = _mm256_set1_epi32((int)sw[6]);
-        __m256i W7_base = _mm256_set1_epi32((int)sw[7]);
+        // Pre-broadcast every W slot that's constant across this whole block.
+        __m256i Wv[16];
+        for (int i = 0; i < 8; ++i) Wv[i] = _mm256_set1_epi32((int)sw[i]);
+        Wv[11] = W11;
+        for (int i = 12; i < 16; ++i) Wv[i] = _mm256_set1_epi32((int)p.msg_words[i]);
 
-        uint64_t inner_end = (salt | 0xFFFF) + 1;
-        if (inner_end > salt_end) inner_end = salt_end;
-
+        const uint64_t l3_end = std::min<uint64_t>(salt_end, (salt | 0xFFFFull) + 1);
         if (global_found.load(std::memory_order_relaxed)) return;
 
-        for (uint64_t s = salt; s + 8 <= inner_end; s += 8) {
-            uint32_t sw8  = salt_lut[(s >> 12) & 0xF];
-            uint32_t sw9  = salt_lut[(s >> 8) & 0xF];
-            uint32_t sw10 = salt_lut[(s >> 4) & 0xF];
+        // Level 2: per 4096 salts. + W[8] constant, run round 8 as scalar.
+        for (uint64_t s3 = salt; s3 < l3_end; s3 = (s3 | 0xFFFull) + 1) {
+            sw[8] = salt_lut[(s3 >> 12) & 0xF];
+            uint32_t l2a = l3a, l2b = l3b, l2c = l3c, l2d = l3d, l2e = l3e;
+            scalar_round(l2a, l2b, l2c, l2d, l2e, sw[8], SHA1_K[0]);
+            Wv[8] = _mm256_set1_epi32((int)sw[8]);
 
-            uint32_t ma = sa, mb = sb, mc = sc, md = sd, me = se;
-            {
-                uint32_t f8 = scalar_ch(mb, mc, md);
-                uint32_t t8 = scalar_round(ma, me, f8, sw8, SHA1_K[0]);
-                me = md; md = mc; mc = (mb << 30) | (mb >> 2); mb = ma; ma = t8;
-                uint32_t f9 = scalar_ch(mb, mc, md);
-                uint32_t t9 = scalar_round(ma, me, f9, sw9, SHA1_K[0]);
-                me = md; md = mc; mc = (mb << 30) | (mb >> 2); mb = ma; ma = t9;
-                uint32_t f10 = scalar_ch(mb, mc, md);
-                uint32_t t10 = scalar_round(ma, me, f10, sw10, SHA1_K[0]);
-                me = md; md = mc; mc = (mb << 30) | (mb >> 2); mb = ma; ma = t10;
-            }
+            const uint64_t l2_end = std::min<uint64_t>(l3_end, (s3 | 0xFFFull) + 1);
 
-            uint32_t sw16 = rotl32(cw13 ^ sw8  ^ sw[2] ^ sw[0], 1);
-            uint32_t sw17 = rotl32(cw14 ^ sw9  ^ sw[3] ^ sw[1], 1);
-            uint32_t sw18 = rotl32(cw15 ^ sw10 ^ sw[4] ^ sw[2], 1);
-            uint32_t sw20 = rotl32(sw17 ^ cw12 ^ sw[6] ^ sw[4], 1);
-            uint32_t sw21 = rotl32(sw18 ^ cw13 ^ sw[7] ^ sw[5], 1);
-            uint32_t sw23 = rotl32(sw20 ^ cw15 ^ sw9   ^ sw[7], 1);
-            uint32_t sw24 = rotl32(sw21 ^ sw16 ^ sw10  ^ sw8,   1);
+            // Level 1: per 256 salts. + W[9] constant, run round 9 as scalar.
+            for (uint64_t s2 = s3; s2 < l2_end; s2 = (s2 | 0xFFull) + 1) {
+                sw[9] = salt_lut[(s2 >> 8) & 0xF];
+                uint32_t l1a = l2a, l1b = l2b, l1c = l2c, l1d = l2d, l1e = l2e;
+                scalar_round(l1a, l1b, l1c, l1d, l1e, sw[9], SHA1_K[0]);
+                Wv[9] = _mm256_set1_epi32((int)sw[9]);
 
-            // AVX2 gather for W[11]: each lane has a different salt nibble
-            __m256i sv = _mm256_add_epi32(_mm256_set1_epi32((int)s), LANE_IDS);
-            __m256i idx = _mm256_and_si256(sv, NIBBLE_MASK);
-            __m256i W11_v = _mm256_i32gather_epi32((const int*)salt_lut, idx, 4);
+                const uint64_t l1_end = std::min<uint64_t>(l2_end, (s2 | 0xFFull) + 1);
 
-            alignas(32) __m256i W[16];
-            W[0]=W0_base; W[1]=W1_base; W[2]=W2_base; W[3]=W3_base;
-            W[4]=W4_base; W[5]=W5_base; W[6]=W6_base; W[7]=W7_base;
-            W[8]=_mm256_set1_epi32((int)sw8);
-            W[9]=_mm256_set1_epi32((int)sw9);
-            W[10]=_mm256_set1_epi32((int)sw10);
-            W[11]=W11_v;
-            W[12]=_mm256_set1_epi32((int)cw12);
-            W[13]=_mm256_set1_epi32((int)cw13);
-            W[14]=_mm256_set1_epi32((int)cw14);
-            W[15]=_mm256_set1_epi32((int)cw15);
+                // Level 0: one batch of 8 salts. + W[10] constant, run round 10.
+                for (uint64_t s = s2; s + 8 <= l1_end; s += 8) {
+                    sw[10] = salt_lut[(s >> 4) & 0xF];
+                    uint32_t ia = l1a, ib = l1b, ic = l1c, id = l1d, ie = l1e;
+                    scalar_round(ia, ib, ic, id, ie, sw[10], SHA1_K[0]);
 
-            __m256i a = _mm256_set1_epi32((int)ma);
-            __m256i b = _mm256_set1_epi32((int)mb);
-            __m256i c = _mm256_set1_epi32((int)mc);
-            __m256i d = _mm256_set1_epi32((int)md);
-            __m256i e = _mm256_set1_epi32((int)me);
-            __m256i f;
+                    // Seed the SIMD W window. W[11] is the only per-lane word
+                    // (one nibble per lane); the rest are lane-uniform broadcasts.
+                    __m256i W[16];
+                    for (int i = 0; i < 16; ++i) W[i] = Wv[i];
+                    W[10] = _mm256_set1_epi32((int)sw[10]);
 
-            f=avx2_ch(b,c,d); AVX2_ROUND_W(a,b,c,d,e,f,W,11,VK0);
-            f=avx2_ch(b,c,d); AVX2_ROUND_W(a,b,c,d,e,f,W,12,VK0);
-            f=avx2_ch(b,c,d); AVX2_ROUND_W(a,b,c,d,e,f,W,13,VK0);
-            f=avx2_ch(b,c,d); AVX2_ROUND_W(a,b,c,d,e,f,W,14,VK0);
-            f=avx2_ch(b,c,d); AVX2_ROUND_W(a,b,c,d,e,f,W,15,VK0);
+                    // Round 11 is partially uniform: only W[11] varies across lanes
+                    // while (a,b,c,d,e) are still scalar broadcasts. Fold the entire
+                    // scalar part of the round into one value and broadcast it, so
+                    // SIMD round 11 collapses from a full sha1_round into a single
+                    // vpaddd.
+                    //
+                    //   t_11 = rol(ia,5) + f_ch(ib,ic,id) + ie + K0 + W[11]
+                    //        = broadcast(scalar_sum) + W[11]
+                    const uint32_t f11        = (ib & ic) | (~ib & id);
+                    const uint32_t t11_scalar = rotl32(ia, 5) + f11 + ie + SHA1_K[0];
 
-            W[0]=_mm256_set1_epi32((int)sw16);
-            f=avx2_ch(b,c,d); AVX2_ROUND_W(a,b,c,d,e,f,W,0,VK0);
-            W[1]=_mm256_set1_epi32((int)sw17);
-            f=avx2_ch(b,c,d); AVX2_ROUND_W(a,b,c,d,e,f,W,1,VK0);
-            W[2]=_mm256_set1_epi32((int)sw18);
-            f=avx2_ch(b,c,d); AVX2_ROUND_W(a,b,c,d,e,f,W,2,VK0);
+                    // Post-round-11 state: only `a` varies per lane; b,c,d,e remain
+                    // lane-uniform (shift pattern of sha1_round with a_new = t_11).
+                    __m256i a = _mm256_add_epi32(W[11], _mm256_set1_epi32((int)t11_scalar));
+                    __m256i b = _mm256_set1_epi32((int)ia);
+                    __m256i c = _mm256_set1_epi32((int)rotl32(ib, 30));
+                    __m256i d = _mm256_set1_epi32((int)ic);
+                    __m256i e = _mm256_set1_epi32((int)id);
 
-            AVX2_EROUND(W,19,a,b,c,d,e,avx2_ch,VK0);
+                    // Rounds 12-79: full SIMD. Split at round-function boundaries
+                    // (20/40/60). Rounds 12-15 use pre-loaded W[12..15]; from
+                    // round 16 on, W[] is a circular buffer (W[i] overwrites
+                    // W[(i-16)&15] via message expansion).
+                    #pragma GCC unroll 4
+                    for (int i = 12; i < 16; ++i)
+                        sha1_round(a, b, c, d, e, f_ch(b,c,d), W[i], VK[0]);
+                    #pragma GCC unroll 4
+                    for (int i = 16; i < 20; ++i) {
+                        W[i&15] = expand(W[(i-3)&15], W[(i-8)&15], W[(i-14)&15], W[(i-16)&15]);
+                        sha1_round(a, b, c, d, e, f_ch(b,c,d), W[i&15], VK[0]);
+                    }
+                    #pragma GCC unroll 20
+                    for (int i = 20; i < 40; ++i) {
+                        W[i&15] = expand(W[(i-3)&15], W[(i-8)&15], W[(i-14)&15], W[(i-16)&15]);
+                        sha1_round(a, b, c, d, e, f_par(b,c,d), W[i&15], VK[1]);
+                    }
+                    #pragma GCC unroll 20
+                    for (int i = 40; i < 60; ++i) {
+                        W[i&15] = expand(W[(i-3)&15], W[(i-8)&15], W[(i-14)&15], W[(i-16)&15]);
+                        sha1_round(a, b, c, d, e, f_maj(b,c,d), W[i&15], VK[2]);
+                    }
+                    #pragma GCC unroll 20
+                    for (int i = 60; i < 80; ++i) {
+                        W[i&15] = expand(W[(i-3)&15], W[(i-8)&15], W[(i-14)&15], W[(i-16)&15]);
+                        sha1_round(a, b, c, d, e, f_par(b,c,d), W[i&15], VK[3]);
+                    }
 
-            W[4]=_mm256_set1_epi32((int)sw20);
-            f=avx2_parity(b,c,d); AVX2_ROUND_W(a,b,c,d,e,f,W,4,VK1);
-            W[5]=_mm256_set1_epi32((int)sw21);
-            f=avx2_parity(b,c,d); AVX2_ROUND_W(a,b,c,d,e,f,W,5,VK1);
+                    // Deferred finalization: only add pre_state[0] and compare the top
+                    // prefix nibbles. False positives (~1 in 2^32) fall through to the
+                    // cold path, which computes the full hash.
+                    __m256i h0 = _mm256_add_epi32(a, _mm256_set1_epi32((int)p.pre_state[0]));
+                    int match = _mm256_movemask_epi8(_mm256_cmpeq_epi32(
+                        _mm256_and_si256(h0, _mm256_set1_epi32((int)p.mask0)),
+                        _mm256_set1_epi32((int)p.target0)));
 
-            AVX2_EROUND(W,22,a,b,c,d,e,avx2_parity,VK1);
+                    if (__builtin_expect(match == 0, 1)) continue;
 
-            W[7]=_mm256_set1_epi32((int)sw23);
-            f=avx2_parity(b,c,d); AVX2_ROUND_W(a,b,c,d,e,f,W,7,VK1);
-            W[8]=_mm256_set1_epi32((int)sw24);
-            f=avx2_parity(b,c,d); AVX2_ROUND_W(a,b,c,d,e,f,W,8,VK1);
+                    __m256i h1 = _mm256_add_epi32(b, _mm256_set1_epi32((int)p.pre_state[1]));
+                    if (p.prefix_len > 8) {
+                        match &= _mm256_movemask_epi8(_mm256_cmpeq_epi32(
+                            _mm256_and_si256(h1, _mm256_set1_epi32((int)p.mask1)),
+                            _mm256_set1_epi32((int)p.target1)));
+                        if (match == 0) continue;
+                    }
 
-            AVX2_EROUND(W,25,a,b,c,d,e,avx2_parity,VK1);
-            AVX2_EROUND(W,26,a,b,c,d,e,avx2_parity,VK1);
-            AVX2_EROUND(W,27,a,b,c,d,e,avx2_parity,VK1);
-            AVX2_EROUND(W,28,a,b,c,d,e,avx2_parity,VK1);
-            AVX2_EROUND(W,29,a,b,c,d,e,avx2_parity,VK1);
-            AVX2_EROUND(W,30,a,b,c,d,e,avx2_parity,VK1);
-            AVX2_EROUND(W,31,a,b,c,d,e,avx2_parity,VK1);
-            AVX2_EROUND(W,32,a,b,c,d,e,avx2_parity,VK1);
-            AVX2_EROUND(W,33,a,b,c,d,e,avx2_parity,VK1);
-            AVX2_EROUND(W,34,a,b,c,d,e,avx2_parity,VK1);
-            AVX2_EROUND(W,35,a,b,c,d,e,avx2_parity,VK1);
-            AVX2_EROUND(W,36,a,b,c,d,e,avx2_parity,VK1);
-            AVX2_EROUND(W,37,a,b,c,d,e,avx2_parity,VK1);
-            AVX2_EROUND(W,38,a,b,c,d,e,avx2_parity,VK1);
-            AVX2_EROUND(W,39,a,b,c,d,e,avx2_parity,VK1);
-
-            AVX2_EROUND(W,40,a,b,c,d,e,avx2_maj,VK2);
-            AVX2_EROUND(W,41,a,b,c,d,e,avx2_maj,VK2);
-            AVX2_EROUND(W,42,a,b,c,d,e,avx2_maj,VK2);
-            AVX2_EROUND(W,43,a,b,c,d,e,avx2_maj,VK2);
-            AVX2_EROUND(W,44,a,b,c,d,e,avx2_maj,VK2);
-            AVX2_EROUND(W,45,a,b,c,d,e,avx2_maj,VK2);
-            AVX2_EROUND(W,46,a,b,c,d,e,avx2_maj,VK2);
-            AVX2_EROUND(W,47,a,b,c,d,e,avx2_maj,VK2);
-            AVX2_EROUND(W,48,a,b,c,d,e,avx2_maj,VK2);
-            AVX2_EROUND(W,49,a,b,c,d,e,avx2_maj,VK2);
-            AVX2_EROUND(W,50,a,b,c,d,e,avx2_maj,VK2);
-            AVX2_EROUND(W,51,a,b,c,d,e,avx2_maj,VK2);
-            AVX2_EROUND(W,52,a,b,c,d,e,avx2_maj,VK2);
-            AVX2_EROUND(W,53,a,b,c,d,e,avx2_maj,VK2);
-            AVX2_EROUND(W,54,a,b,c,d,e,avx2_maj,VK2);
-            AVX2_EROUND(W,55,a,b,c,d,e,avx2_maj,VK2);
-            AVX2_EROUND(W,56,a,b,c,d,e,avx2_maj,VK2);
-            AVX2_EROUND(W,57,a,b,c,d,e,avx2_maj,VK2);
-            AVX2_EROUND(W,58,a,b,c,d,e,avx2_maj,VK2);
-            AVX2_EROUND(W,59,a,b,c,d,e,avx2_maj,VK2);
-
-            AVX2_EROUND(W,60,a,b,c,d,e,avx2_parity,VK3);
-            AVX2_EROUND(W,61,a,b,c,d,e,avx2_parity,VK3);
-            AVX2_EROUND(W,62,a,b,c,d,e,avx2_parity,VK3);
-            AVX2_EROUND(W,63,a,b,c,d,e,avx2_parity,VK3);
-            AVX2_EROUND(W,64,a,b,c,d,e,avx2_parity,VK3);
-            AVX2_EROUND(W,65,a,b,c,d,e,avx2_parity,VK3);
-            AVX2_EROUND(W,66,a,b,c,d,e,avx2_parity,VK3);
-            AVX2_EROUND(W,67,a,b,c,d,e,avx2_parity,VK3);
-            AVX2_EROUND(W,68,a,b,c,d,e,avx2_parity,VK3);
-            AVX2_EROUND(W,69,a,b,c,d,e,avx2_parity,VK3);
-            AVX2_EROUND(W,70,a,b,c,d,e,avx2_parity,VK3);
-            AVX2_EROUND(W,71,a,b,c,d,e,avx2_parity,VK3);
-            AVX2_EROUND(W,72,a,b,c,d,e,avx2_parity,VK3);
-            AVX2_EROUND(W,73,a,b,c,d,e,avx2_parity,VK3);
-            AVX2_EROUND(W,74,a,b,c,d,e,avx2_parity,VK3);
-            AVX2_EROUND(W,75,a,b,c,d,e,avx2_parity,VK3);
-            AVX2_EROUND(W,76,a,b,c,d,e,avx2_parity,VK3);
-            AVX2_EROUND(W,77,a,b,c,d,e,avx2_parity,VK3);
-            AVX2_EROUND(W,78,a,b,c,d,e,avx2_parity,VK3);
-            AVX2_EROUND(W,79,a,b,c,d,e,avx2_parity,VK3);
-
-            // Deferred finalization
-            a = _mm256_add_epi32(a, INIT_A);
-            __m256i cmp0 = _mm256_cmpeq_epi32(_mm256_and_si256(a, vmask0), vtarget0);
-            int match = _mm256_movemask_epi8(cmp0);
-
-            if (__builtin_expect(match != 0, 0)) {
-                b = _mm256_add_epi32(b, INIT_B);
-                if (pn > 8) {
-                    __m256i cmp1 = _mm256_cmpeq_epi32(_mm256_and_si256(b, vmask1), vtarget1);
-                    match &= _mm256_movemask_epi8(cmp1);
-                }
-                if (match != 0) {
-                    c = _mm256_add_epi32(c, INIT_C);
-                    d = _mm256_add_epi32(d, INIT_D);
-                    e = _mm256_add_epi32(e, INIT_E);
-
-                    alignas(32) uint32_t ha[8], hb[8], hc[8], hd[8], he[8];
-                    _mm256_store_si256((__m256i*)ha, a);
-                    _mm256_store_si256((__m256i*)hb, b);
-                    _mm256_store_si256((__m256i*)hc, c);
-                    _mm256_store_si256((__m256i*)hd, d);
-                    _mm256_store_si256((__m256i*)he, e);
-
-                    // Each lane is 4 bytes in movemask, find first set lane
+                    // Full hash extraction (runs at most once per solve).
+                    // movemask_epi8 produces 4 bits per 32-bit lane -> divide by 4.
                     int lane = __builtin_ctz(match) / 4;
-                    result.salt = s + lane;
-                    result.hash[0] = ha[lane]; result.hash[1] = hb[lane];
-                    result.hash[2] = hc[lane]; result.hash[3] = hd[lane];
-                    result.hash[4] = he[lane];
-                    result.found = true;
-                    result.hashes = s + lane - salt_start + 1;
+                    alignas(32) uint32_t buf[8];
+                    auto extract = [&](__m256i v) { _mm256_store_si256((__m256i*)buf, v); return buf[lane]; };
+                    result.hash[0] = extract(h0);
+                    result.hash[1] = extract(h1);
+                    result.hash[2] = extract(_mm256_add_epi32(c, _mm256_set1_epi32((int)p.pre_state[2])));
+                    result.hash[3] = extract(_mm256_add_epi32(d, _mm256_set1_epi32((int)p.pre_state[3])));
+                    result.hash[4] = extract(_mm256_add_epi32(e, _mm256_set1_epi32((int)p.pre_state[4])));
+                    result.salt    = s + lane;
+                    result.found   = true;
+                    result.hashes  = s + lane - salt_start + 1;
                     global_found.store(true, std::memory_order_relaxed);
                     return;
                 }
             }
         }
-
-        result.hashes = inner_end - salt_start;
-        salt = inner_end;
+        result.hashes = l3_end - salt_start;
+        salt = l3_end;
     }
-
     result.hashes = salt_end - salt_start;
 }
-
-#endif // __x86_64__
