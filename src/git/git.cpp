@@ -1,112 +1,102 @@
 #include "git/git.h"
 
+#include <algorithm>
 #include <array>
-#include <cstdio>
 #include <fcntl.h>
+#include <optional>
 #include <stdexcept>
 #include <sys/wait.h>
 #include <unistd.h>
 
 namespace git {
 
-// Fork+exec a git command, capture stdout into a byte vector.
-// Avoids popen/shell overhead entirely.
-static std::vector<uint8_t> exec_git(const std::vector<const char*>& argv) {
-    int pipefd[2];
-    if (pipe(pipefd) < 0) throw std::runtime_error("pipe failed");
+// RAII pipe pair. Closes both ends on destruction; take() / close_end() let
+// us relinquish ownership piecewise.
+struct Pipe {
+    int fd[2] = {-1, -1};
+    Pipe() { if (pipe(fd) < 0) throw std::runtime_error("pipe failed"); }
+    ~Pipe() { for (int& f : fd) if (f >= 0) ::close(f); }
+    Pipe(const Pipe&) = delete;
+    Pipe& operator=(const Pipe&) = delete;
+    void close_end(int i) { if (fd[i] >= 0) { ::close(fd[i]); fd[i] = -1; } }
+};
 
-    pid_t pid = fork();
-    if (pid < 0) { close(pipefd[0]); close(pipefd[1]); throw std::runtime_error("fork failed"); }
+// Fork+exec `argv` (NUL terminator added automatically), optionally piping
+// `stdin_data` to its stdin; return its stdout. Stderr is routed to /dev/null.
+static std::vector<uint8_t> run_git(std::initializer_list<const char*> argv,
+                                    const std::vector<uint8_t>* stdin_data = nullptr) {
+    Pipe out;
+    std::optional<Pipe> in;
+    if (stdin_data) in.emplace();
 
-    if (pid == 0) {
-        close(pipefd[0]);
-        dup2(pipefd[1], STDOUT_FILENO);
-        close(pipefd[1]);
-        int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
-        execvp("git", const_cast<char* const*>(argv.data()));
-        _exit(1);
-    }
-
-    close(pipefd[1]);
-    std::vector<uint8_t> out;
-    std::array<char, 4096> buf;
-    for (;;) {
-        auto n = ::read(pipefd[0], buf.data(), buf.size());
-        if (n <= 0) break;
-        out.insert(out.end(), buf.data(), buf.data() + n);
-    }
-    close(pipefd[0]);
-    waitpid(pid, nullptr, 0);
-    return out;
-}
-
-HexDigest get_head_digest() {
-    auto out = exec_git({"git", "rev-parse", "HEAD", nullptr});
-    // Strip trailing newline
-    while (!out.empty() && out.back() == '\n') out.pop_back();
-    if (out.size() != 40) throw std::runtime_error("bad HEAD");
-    HexDigest d;
-    std::copy(out.begin(), out.end(), d.begin());
-    return d;
-}
-
-std::vector<uint8_t> get_commit_contents(const HexDigest& digest) {
-    // Use a stack buffer for the digest string to avoid allocation
-    char hash[41];
-    std::copy(digest.begin(), digest.end(), hash);
-    hash[40] = '\0';
-    return exec_git({"git", "cat-file", "-p", hash, nullptr});
-}
-
-HexDigest write_object(const std::string& type, const std::vector<uint8_t>& contents) {
-    int to_child[2], from_child[2];
-    if (pipe(to_child) < 0 || pipe(from_child) < 0)
-        throw std::runtime_error("pipe failed");
-
-    pid_t pid = fork();
+    const pid_t pid = fork();
     if (pid < 0) throw std::runtime_error("fork failed");
 
     if (pid == 0) {
-        close(to_child[1]); close(from_child[0]);
-        dup2(to_child[0], STDIN_FILENO);
-        dup2(from_child[1], STDOUT_FILENO);
-        close(to_child[0]); close(from_child[1]);
-        int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
-        execlp("git", "git", "hash-object", "-w", "-t", type.c_str(), "--stdin", nullptr);
+        // Child: wire up std{in,out,err}, then exec.
+        if (in) { dup2(in->fd[0], STDIN_FILENO); in.reset(); }
+        dup2(out.fd[1], STDOUT_FILENO);
+        out.close_end(0); out.close_end(1);
+        if (int nul = open("/dev/null", O_WRONLY); nul >= 0) {
+            dup2(nul, STDERR_FILENO); ::close(nul);
+        }
+        std::vector<char*> av;
+        av.reserve(argv.size() + 1);
+        for (const char* s : argv) av.push_back(const_cast<char*>(s));
+        av.push_back(nullptr);
+        execvp(av[0], av.data());
         _exit(1);
     }
 
-    close(to_child[0]); close(from_child[1]);
-
-    auto* ptr = contents.data();
-    size_t rem = contents.size();
-    while (rem > 0) {
-        auto n = ::write(to_child[1], ptr, rem);
-        if (n <= 0) break;
-        ptr += n; rem -= n;
+    // Parent: feed stdin (if any), drain stdout, reap.
+    if (in) {
+        in->close_end(0);
+        const uint8_t* p = stdin_data->data();
+        for (size_t rem = stdin_data->size(); rem > 0;) {
+            const auto n = ::write(in->fd[1], p, rem);
+            if (n <= 0) break;
+            p += n; rem -= n;
+        }
+        in.reset();
     }
-    close(to_child[1]);
+    out.close_end(1);
 
-    char buf[64];
-    ssize_t total = 0;
-    while (total < 40) {
-        auto n = ::read(from_child[0], buf + total, 40 - total);
+    std::vector<uint8_t> result;
+    std::array<char, 4096> buf;
+    for (;;) {
+        const auto n = ::read(out.fd[0], buf.data(), buf.size());
         if (n <= 0) break;
-        total += n;
+        result.insert(result.end(), buf.data(), buf.data() + n);
     }
-    close(from_child[0]);
     waitpid(pid, nullptr, 0);
+    return result;
+}
 
-    if (total < 40) throw std::runtime_error("bad hash-object output");
+// Copy a 40-char hex digest out of a byte buffer (trailing \n stripped).
+static HexDigest to_digest(std::vector<uint8_t> bytes) {
+    while (!bytes.empty() && bytes.back() == '\n') bytes.pop_back();
+    if (bytes.size() != 40) throw std::runtime_error("unexpected git output");
     HexDigest d;
-    std::copy(buf, buf + 40, d.begin());
+    std::copy(bytes.begin(), bytes.end(), d.begin());
     return d;
 }
 
+HexDigest get_head_digest() {
+    return to_digest(run_git({"git", "rev-parse", "HEAD"}));
+}
+
+std::vector<uint8_t> get_commit_contents(const HexDigest& digest) {
+    const std::string hash(digest.data(), digest.size());
+    return run_git({"git", "cat-file", "-p", hash.c_str()});
+}
+
+HexDigest write_object(const std::string& type, const std::vector<uint8_t>& contents) {
+    return to_digest(run_git(
+        {"git", "hash-object", "-w", "-t", type.c_str(), "--stdin"}, &contents));
+}
+
 void update_reference(const std::string& ref, const std::string& hash) {
-    exec_git({"git", "update-ref", ref.c_str(), hash.c_str(), nullptr});
+    run_git({"git", "update-ref", ref.c_str(), hash.c_str()});
 }
 
 }  // namespace git
