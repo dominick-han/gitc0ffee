@@ -12,6 +12,7 @@
 #include <vector>
 
 static int g_run = 0, g_pass = 0, g_fail = 0;
+static std::string g_backend;   // argv[1]: force a backend (default: auto)
 
 static std::string cpu_sha1_hex(const std::vector<uint8_t>& data) {
     unsigned char hash[20];
@@ -45,7 +46,7 @@ static void check_cpu(const std::string& label, const std::string& prefix,
     auto raw = make_commit(msg);
     auto obj = parse_commit(raw);
     auto tpl = prepare_template(obj);
-    auto result = solve(tpl, prefix);
+    auto result = solve(tpl, prefix, g_backend);
 
     if (!result) {
         fprintf(stderr, "not ok %d - %s: solve returned nullopt\n", g_run, label.c_str());
@@ -87,7 +88,8 @@ static void check_cpu(const std::string& label, const std::string& prefix,
     ++g_pass;
 }
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc > 1) g_backend = argv[1];
     fprintf(stderr, "TAP version 13\n");
 
     // Short prefixes (instant)
@@ -124,14 +126,14 @@ int main() {
         auto raw = make_commit("re-run test\n");
         auto obj = parse_commit(raw);
         auto tpl = prepare_template(obj);
-        auto r1 = solve(tpl, "aa");
+        auto r1 = solve(tpl, "aa", g_backend);
         if (!r1) {
             fprintf(stderr, "not ok %d - re-run: first solve failed\n", g_run);
             ++g_fail;
         } else {
             auto obj2 = parse_commit(r1->payload);
             auto tpl2 = prepare_template(obj2);
-            auto r2 = solve(tpl2, "bb");
+            auto r2 = solve(tpl2, "bb", g_backend);
             if (!r2) {
                 fprintf(stderr, "not ok %d - re-run: second solve failed\n", g_run);
                 ++g_fail;

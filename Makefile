@@ -1,4 +1,5 @@
 UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
 MARCH   ?= -march=native
 PREFIX  ?= /usr/local
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
@@ -20,9 +21,15 @@ ifeq ($(UNAME_S),Darwin)
   SRCS_MM  := src/gpu/metal_solver.mm
 else
   CXX      := g++
-  CXXFLAGS += -msha -msse4.1 -mssse3 -flto -fno-plt
+  CXXFLAGS += -flto -fno-plt
   LIBS     += -lpthread
-  SRCS     += src/cpu/solver.cpp src/cpu/avx512.cpp src/cpu/sha_ni.cpp src/cpu/avx2.cpp
+  SRCS     += src/cpu/solver.cpp src/cpu/scalar.cpp
+  ifeq ($(UNAME_M),aarch64)
+    SRCS     += src/cpu/arm_sha1.cpp
+  else
+    CXXFLAGS += -msha -msse4.1 -mssse3
+    SRCS     += src/cpu/avx512.cpp src/cpu/sha_ni.cpp src/cpu/avx2.cpp
+  endif
 endif
 
 OBJS := $(patsubst %.cpp,$(B)/%.o,$(notdir $(SRCS))) \

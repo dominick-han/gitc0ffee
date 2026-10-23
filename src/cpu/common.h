@@ -3,7 +3,9 @@
 
 #include <atomic>
 #include <cstdint>
+#if defined(__x86_64__)
 #include <immintrin.h>
+#endif
 
 static constexpr int kSaltBytes = 48;
 
@@ -28,8 +30,10 @@ struct CPUParams {
     uint32_t pre_state[5];
     uint32_t mask0, target0;
     uint32_t mask1, target1;
+#if defined(__x86_64__)
     __m128i  msg3_const;      // SHA-NI: precomputed MSG3 (words 12-15).
-    uint32_t msg_words[16];   // AVX2/AVX-512: full block as 32-bit words.
+#endif
+    uint32_t msg_words[16];   // Full final block as 32-bit words (salt words zeroed).
 };
 
 struct WorkerResult {
@@ -45,6 +49,16 @@ struct WorkerResult {
 using WorkerFn = void(*)(const CPUParams&, uint64_t, uint64_t,
                          std::atomic<bool>&, WorkerResult&);
 
+#if defined(__x86_64__)
 void avx512_worker(const CPUParams&, uint64_t, uint64_t, std::atomic<bool>&, WorkerResult&);
 void sha_ni_worker(const CPUParams&, uint64_t, uint64_t, std::atomic<bool>&, WorkerResult&);
 void avx2_worker  (const CPUParams&, uint64_t, uint64_t, std::atomic<bool>&, WorkerResult&);
+#elif defined(__aarch64__)
+void arm_sha1_worker(const CPUParams&, uint64_t, uint64_t, std::atomic<bool>&, WorkerResult&);
+#endif
+// Portable fallback, available on every architecture.
+void scalar_worker(const CPUParams&, uint64_t, uint64_t, std::atomic<bool>&, WorkerResult&);
+
+// Reference single-block SHA-1 compression of the final block for `salt`,
+// starting from p.pre_state. Writes the finalized digest words to out[5].
+void sha1_final_block(const CPUParams& p, uint64_t salt, uint32_t out[5]);

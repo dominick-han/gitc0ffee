@@ -12,9 +12,15 @@ Make your commits start with `c0ffee`, `deadbeef`, `badc0de` - or whatever makes
 - OpenSSL 3 (`brew install openssl@3` or build from source)
 - Xcode Command Line Tools (`xcode-select --install`)
 
-### Linux (CPU with AVX-512, SHA-NI, or AVX2)
+### Linux x86-64 (CPU with AVX-512, SHA-NI, or AVX2)
 
 - x86-64 CPU with AVX-512 (Intel Skylake-X+, AMD Zen 4+), SHA-NI (Intel Goldmont+, AMD Zen+), or AVX2 (Intel Haswell+, AMD Excavator+)
+- OpenSSL development headers (`libssl-dev` / `openssl-devel`)
+- GCC 10+ with C++20 support
+
+### Linux arm64 (CPU with ARMv8 SHA1 extensions)
+
+- aarch64 CPU; uses the ARMv8 Crypto Extensions SHA1 instructions when present (AWS Graviton, Ampere, Neoverse, Cortex-A53+ with crypto), otherwise a portable scalar fallback
 - OpenSSL development headers (`libssl-dev` / `openssl-devel`)
 - GCC 10+ with C++20 support
 
@@ -102,6 +108,10 @@ Sustained throughput: ~3.6 GH/s.
 
 Sustained throughput: ~22 GH/s with AVX-512 (16-way), ~15 GH/s with SHA-NI (4-way), AVX2 (8-way) as universal fallback. Backend auto-selected at runtime.
 
+### Linux arm64 (Graviton3 / Neoverse V1, 64 cores)
+
+Sustained throughput: ~4.9 GH/s with ARMv8 SHA1 (4-way), ~0.75 GH/s scalar fallback. Backend auto-selected at runtime via `HWCAP_SHA1`.
+
 ## How it works
 
 1. Read the current HEAD commit.
@@ -160,6 +170,9 @@ src/
     avx512.cpp        AVX-512 backend: 16-way SIMD SHA1
     sha_ni.cpp        SHA-NI backend: 4-way interleaved SHA1
     avx2.cpp          AVX2 backend: 8-way SIMD SHA1
+    arm_sha1.cpp      ARMv8 SHA1 backend: 4-way interleaved (aarch64)
+    scalar.cpp        Portable scalar backend + reference final-block SHA1
+    walk.h            Shared salt-enumeration / precompute skeleton
   gpu/
     metal_solver.mm   Metal GPU dispatch and SHA1 pre-computation (macOS)
     sha1.metal        Metal compute shader (SHA1 brute-force kernel)

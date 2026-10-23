@@ -1,12 +1,17 @@
 // solver.cpp - multi-threaded SHA-1 brute-force with runtime dispatch.
 //
-// Three backends, selected by CPUID in priority order:
-//   1. AVX-512: 16-way SIMD using 512-bit registers
-//   2. SHA-NI:   4-way interleaved x86 SHA extensions
-//   3. AVX2:     8-way SIMD using 256-bit registers (universal fallback)
+// Backends, selected at runtime in priority order:
+//   x86_64:
+//     1. AVX-512: 16-way SIMD using 512-bit registers
+//     2. SHA-NI:   4-way interleaved x86 SHA extensions
+//     3. AVX2:     8-way SIMD using 256-bit registers (x86 fallback)
+//   aarch64:
+//     1. ARMv8 SHA1 crypto extensions, 4-way interleaved (HWCAP_SHA1)
+//     2. Scalar (portable fallback)
+//   The scalar backend is also selectable on x86_64 via --backend scalar.
 
-#ifndef __x86_64__
-#error "CPU solver requires x86_64 (AVX2/AVX-512/SHA-NI)"
+#if !defined(__x86_64__) && !defined(__aarch64__)
+#error "CPU solver requires x86_64 or aarch64"
 #endif
 
 #include "solver.h"
@@ -20,12 +25,18 @@
 #include <thread>
 #include <vector>
 #ifdef __linux__
-#include <cpuid.h>
 #include <sched.h>
+#if defined(__x86_64__)
+#include <cpuid.h>
+#elif defined(__aarch64__)
+#include <asm/hwcap.h>
+#include <sys/auxv.h>
+#endif
 #endif
 
 // --- CPU feature detection -------------------------------------------------
 
+#if defined(__x86_64__)
 // Test bit `b` of CPUID leaf 7 subleaf 0, register ebx.
 static bool cpuid7(unsigned b) {
 #ifdef __linux__
@@ -37,6 +48,15 @@ static bool cpuid7(unsigned b) {
 }
 static bool has_avx512() { return cpuid7(16) && cpuid7(30); }  // F + BW
 static bool has_sha_ni() { return cpuid7(29); }
+#elif defined(__aarch64__)
+static bool has_arm_sha1() {
+#ifdef __linux__
+    return (getauxval(AT_HWCAP) & HWCAP_SHA1) != 0;
+#else
+    return false;
+#endif
+}
+#endif
 
 // --- Prefix -> mask/target -------------------------------------------------
 //
@@ -97,8 +117,10 @@ static void build_sha1_state(const ObjectTemplate& tpl, CPUParams& p) {
         std::memcpy(&w, block + i * 4, 4);
         p.msg_words[i] = __builtin_bswap32(w);
     }
+#if defined(__x86_64__)
     p.msg3_const = _mm_set_epi32((int)p.msg_words[12], (int)p.msg_words[13],
                                  (int)p.msg_words[14], (int)p.msg_words[15]);
+#endif
 }
 
 // --- Backend selection -----------------------------------------------------
@@ -111,9 +133,14 @@ struct Backend {
 };
 
 static constexpr Backend kBackends[] = {
+#if defined(__x86_64__)
     {"avx512", "AVX-512, 16-way", avx512_worker, has_avx512},
     {"sha-ni", "SHA-NI, 4-way",   sha_ni_worker, has_sha_ni},
     {"avx2",   "AVX2, 8-way",     avx2_worker,   nullptr},
+#elif defined(__aarch64__)
+    {"arm-sha1", "ARMv8 SHA1, 4-way", arm_sha1_worker, has_arm_sha1},
+#endif
+    {"scalar", "Scalar, 1-way",   scalar_worker, nullptr},
 };
 
 static const Backend* select_backend(const std::string& want) {

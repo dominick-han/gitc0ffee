@@ -16,7 +16,7 @@ static void usage(const char* prog) {
         "Usage: %s [OPTIONS] [HEX]\n\n"
         "  HEX             hex prefix to match (default: c0ffee)\n"
         "  -w, --write     write object and update HEAD\n"
-        "  -b, --backend   force backend (avx512, sha-ni, avx2, metal)\n"
+        "  -b, --backend   force backend (avx512, sha-ni, avx2, arm-sha1, scalar, metal)\n"
         "  -q, --quiet     suppress progress output\n"
         "  -V, --version   print version\n"
         "  -h, --help      show this help\n", prog);
